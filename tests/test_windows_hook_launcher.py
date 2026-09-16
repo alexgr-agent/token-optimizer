@@ -378,7 +378,16 @@ def test_windows_versioned_hook_executes_through_comspec(monkeypatch, tmp_path):
         _make_fake_runner(base / version)
     _install_test_launcher(base)
     monkeypatch.setattr(module, "_repo_root", lambda: base / "5.11.75")
-    argument = 'space & pipe| quote" percent% bang!'
+    # cmd.exe parses the raw /C line by its own rules, not list2cmdline's:
+    # a list2cmdline \" escape is not a cmd escape (it flips cmd's quote
+    # parity and exposes every later metachar), and %...% pairs expand
+    # across the whole line even inside quotes. Generated commands never
+    # contain either (Windows forbids " in file names, so no baked path or
+    # value can carry one; a %-bearing install path is the documented
+    # limitation with the no-% mitigation), so this leg exercises the
+    # supported envelope. Embedded quotes and percent stay covered by the
+    # direct-execution tests above, which parse no cmd line at all.
+    argument = "space & pipe| caret^ angle< > paren( ) bang! apostrophe'"
     command = module._hook_command("hooks/test.py", argument,
                                    extra_env={"TO_TEST": argument})
     proc = subprocess.run(
