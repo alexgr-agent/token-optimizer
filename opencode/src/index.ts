@@ -757,7 +757,15 @@ export const TokenOptimizerPlugin: Plugin = async (
     },
   };
 
-  return hooks;
+  const dispose = async () => {
+    for (const [sid, state] of sessions) {
+      flushSession(sid, state);
+      state.store.close();
+    }
+    sessions.clear();
+    trendsStore?.close();
+  };
+  return Object.assign(hooks, { dispose });
 };
 
 function estimateFillFromSession(store: SessionStore, model?: string): number {
