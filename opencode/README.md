@@ -1,6 +1,6 @@
 # Token Optimizer for OpenCode
 
-Context quality scoring, smart compaction, and session continuity for [OpenCode](https://github.com/anomalyco/opencode). Version 1.2 supports OpenCode V2 and V1 1.18.29 or newer. Older V1 builds need the 1.1.x plugin.
+Context quality scoring, smart compaction, and session continuity for [OpenCode](https://github.com/anomalyco/opencode). Version 1.2 adds OpenCode V2 plugin support while keeping the V1 entrypoint. The offline bundle has been exercised with V2 2.0.18 and V1 1.18.33; older V1 builds need the 1.1.x plugin. Registry delivery and the oldest stated V1 version still need verification.
 
 ## What It Does
 
@@ -39,7 +39,11 @@ OpenCode's config schema. No separate install command is needed.
 ## Where your data goes
 
 By default, nothing is written into your project. Data (session history and
-`trends.db`) lives in a per-user location outside any repo:
+`trends.db`) lives in a per-user location outside any repo. Checkpoints may retain
+recent prompt excerpts (up to five, 300 characters each) and absolute paths of files
+read or edited; session activity also records paths locally. If you set `dataDir`
+to a folder inside a repo, add that folder to `.gitignore` and restrict access as
+needed so private session data is not committed:
 
 | OS      | Default location                              |
 | ------- | --------------------------------------------- |

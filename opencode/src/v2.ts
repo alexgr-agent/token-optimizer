@@ -4,8 +4,8 @@ import { TokenOptimizerPlugin } from "./index.js";
 
 function textOf(result: unknown): string {
   if (!result || typeof result !== "object") return "";
-  const r = result as { content?: string | readonly { type: string; text?: string }[] };
-  return typeof r.content === "string" ? r.content : (r.content ?? []).filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n");
+  const r = result as { output?: string; content?: string | readonly { type: string; text?: string }[] };
+  return typeof r.output === "string" ? r.output : typeof r.content === "string" ? r.content : (r.content ?? []).filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n");
 }
 
 export async function setupV2(ctx: Context): Promise<Cleanup> {
@@ -16,6 +16,8 @@ export async function setupV2(ctx: Context): Promise<Cleanup> {
   } as unknown as Parameters<typeof TokenOptimizerPlugin>[0], ctx.options);
   const abort = new AbortController();
   let closed = false;
+  // Admission may retry the same message. Keep only a bounded set of IDs.
+  const admitted = new Set<string>();
 
   const registrations: { dispose: () => Promise<void> }[] = [];
   const register = async (promise: Promise<{ dispose: () => Promise<void> }>) => { registrations.push(await promise); };
@@ -28,8 +30,10 @@ export async function setupV2(ctx: Context): Promise<Cleanup> {
         name,
         description: name === "token_status" ? "Report context health, warnings, fill, and activity." : "Generate the local Token Optimizer dashboard.",
         input: { type: "object", properties: name === "token_status" ? { detail: { type: "boolean" } } : { days: { type: "number" } }, additionalProperties: false },
-        async execute(input) {
-          const result = await tool.execute(input as never, {} as never);
+        async execute(input, context) {
+          const result = name === "token_status"
+            ? await (legacy as typeof legacy & { statusForSession: (id: string, args: { detail?: boolean }) => Promise<{ output: string }> }).statusForSession(context.sessionID, input as { detail?: boolean })
+            : await tool.execute(input as never, {} as never);
           return { content: typeof result === "string" ? result : result.output ?? "" };
         },
       });
@@ -41,6 +45,9 @@ export async function setupV2(ctx: Context): Promise<Cleanup> {
     Object.assign(event.env, env);
   }));
   await register(ctx.session.hook("prompt", async (event) => {
+    if (admitted.has(event.messageID)) return;
+    admitted.add(event.messageID);
+    if (admitted.size > 1024) admitted.delete(admitted.values().next().value!);
     await legacy["chat.message"]?.({ sessionID: event.sessionID } as never, {
       parts: [{ type: "text", text: event.prompt.text }],
     } as never);
@@ -84,6 +91,16 @@ export async function setupV2(ctx: Context): Promise<Cleanup> {
               } },
             } } as never);
           } else if (event.type === "session.compaction.ended") {
+            // Compaction is a separate model request, with its own usage/cost.
+            if (data.tokens || data.cost) {
+              await legacy.event?.({ event: {
+                type: "message.updated", properties: { info: {
+                  role: "assistant", id: event.id, sessionID: data.sessionID,
+                  tokens: data.tokens, cost: data.cost,
+                  modelID: (data.model as { id?: string } | undefined)?.id,
+                } },
+              } } as never);
+            }
             await legacy["experimental.compaction.autocontinue"]?.({ sessionID: data.sessionID } as never, {} as never);
           } else if (event.type === "session.idle") {
             await legacy.event?.({ event: { type: "session.idle", properties: { sessionID: data.sessionID } } } as never);
