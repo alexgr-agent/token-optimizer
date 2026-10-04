@@ -610,6 +610,22 @@ python3 measure.py setup-quality-bar --uninstall
 
 </details>
 
+## Desktop Status Bar
+
+Using the Claude desktop app? The status bar comes with the Token Optimizer plugin: once it is installed, the bar appears above your prompt. Nothing extra to install.
+
+It needs Claude Code 2.1.287 or newer and Anthropic's mods feature. Anthropic can switch mods off remotely; if that happens nothing breaks, the bar just doesn't appear. The terminal keeps its existing status line. VS Code is not supported. To hide it, add `"TOKEN_OPTIMIZER_STATUS_BAR": "0"` to the `env` block of `~/.claude/settings.json`; `"TOKEN_OPTIMIZER_STATUS_BAR_ANIMATE": "0"` keeps Clawd still.
+
+- **One sentence, one button**: the most urgent thing about your session, with at most one button to act on it.
+- **Five marks**: quality grade, context fill, cache countdown, 5-hour limit and weekly limit, each with its label. Hover any mark for a card with the detail.
+- **The arrow beside Clawd** unfolds one more line: branch, session time, tool calls, compactions (when there are any), when the last checkpoint was saved (any kind, or a relevant one from an earlier session), and how many tokens Token Optimizer saved you in the last 30 days, the same total the dashboard shows.
+- **Clawd acts out the session**: thinking, reading, typing, subagents, waiting for your permission, writing, compacting, done, stopped, API error, cold cache, napping.
+- **Clean up**: compacts with Token Optimizer's guidance.
+- **Start fresh**: asks for a second click, then saves a checkpoint, clears, and hands the checkpoint to your first message.
+- **Keep warm**: a manual, one-click cache refresh. It is offered only while the cache is still warm, never runs on its own, and uses a small amount of your usage. Afterwards it tells you how many tokens it re-read from the cache.
+
+Point at the bar and Clawd looks over. The cache countdown is an estimate, because Claude does not publish the exact expiry: 1 hour on Claude plans, 5 minutes on the API, measured from the session itself when possible.
+
 ## Coach Mode
 
 ```
@@ -665,6 +681,8 @@ python3 measure.py keepwarm-enable          # opt in (API billing only)
 python3 measure.py keepwarm-report            # net savings, spend, tripwire state
 python3 measure.py keepwarm-disable           # opt out any time
 ```
+
+Prefer a button? The [desktop status bar](#desktop-status-bar) has a manual **Keep warm** refresh. It is a separate one-click action, never automatic, and does not use the API-billed daemon above.
 
 ### Fleet Auditor
 

@@ -1,4 +1,7 @@
 {
+  "modules": [
+    "../desktop/token-optimizer-desktop/hooks/register.tsx"
+  ],
   "hooks": {
     "PreToolUse": [
       {

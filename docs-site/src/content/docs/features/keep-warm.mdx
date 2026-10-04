@@ -138,6 +138,20 @@ python3 measure.py keepwarm-scheduler uninstall
 | Cache TTL refreshed | ~1 hour (5 min short window) | Anthropic API cache |
 | Tripwire | counts successful pings only | Backs off when NET stops justifying spend |
 
+## The manual Keep warm button
+
+The Claude desktop status bar (part of the Token Optimizer plugin) has a **Keep warm** button. It is not the daemon described on this page.
+
+| | Keep-Warm daemon | Keep warm button |
+|---|---|---|
+| Runs | automatically, on a timer | only when you click |
+| Billing | API billing only | any plan |
+| Offered | while armed | only while the cache is still warm and its lifetime has been measured |
+| After expiry | keeps going until the tripwire stops it | disappears when the cache expires |
+| Cost | cache-read pings, tracked in `keepwarm-report` | a small amount of your usage per click; it tells you how many tokens it re-read from the cache |
+
+The daemon stays API-billing only and its consent rules are unchanged. The button never fires on its own. See [the desktop status bar](/features/status-line/#the-desktop-status-bar).
+
 ## Risk rating
 
 Low, by design, and the only feature that spends tokens. The risks are managed: consent gates firing, the NET-aware report and tripwire prevent runaway spend, and subscription billing is refused outright. The failure mode of a ping is a small wasted spend, capped by the tripwire and visible in `keepwarm-report`. If the tick or scheduler fails, no ping fires and you fall back to ordinary cold resumes.

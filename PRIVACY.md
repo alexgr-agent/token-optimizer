@@ -52,7 +52,7 @@ SQLite databases with file read records, content hashes, token estimates, and ca
 Markdown files containing truncated conversation context for session continuity. Each checkpoint includes up to 300 characters of the last user message and last assistant message, extracted file paths, decision text, error snippets (up to 150 characters), and todo items.
 
 - **Path:** `~/.claude/token-optimizer/checkpoints/`
-- **Retention:** Configurable via `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_DAYS` (default: 7 days) and `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` (default: 50 files)
+- **Retention:** Configurable via `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_DAYS` (default: 7 days) `TOKEN_OPTIMIZER_CHECKPOINT_PER_SESSION` (default: 5 per session) and `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` (default: 400 files in total)
 - **Sensitive content:** Truncated conversation snippets may contain PII or sensitive information the user typed into the coding assistant
 
 ### Tool Archives

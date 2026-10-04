@@ -12640,6 +12640,26 @@ def _log_compression_event(feature, original_text="", compressed_text="",
         pass
 
 
+def _compression_row_rate(model, fallback_rate, tier_data):
+    """USD per million input tokens for one compression_events row.
+
+    Per-model rate from the row's stored event-time model, else the
+    current-session fallback. Shared by _get_compression_summary and the
+    status-bar buckets so both price a row identically.
+    """
+    if detect_runtime() == 'codex':
+        model_rates = _input_and_cached_read_rates(model)
+        return model_rates[0] if model_rates else 0.0
+    if model:
+        norm_m = _claude_price_key(model, tier_data["claude_models"]) or "sonnet"
+        return (
+            tier_data["claude_models"]
+            .get(norm_m, tier_data["claude_models"].get("sonnet", {}))
+            .get("input", fallback_rate)
+        )
+    return fallback_rate
+
+
 def _get_compression_summary(days=30, since=None):
     """Query compression events and return a summary dict.
 
@@ -12695,19 +12715,7 @@ def _get_compression_summary(days=30, since=None):
             orig = orig or 0
             comp = comp or 0
             cnt = cnt or 0
-            # Per-model rate: use stored model if available, else current-session fallback.
-            if detect_runtime() == 'codex':
-                model_rates = _input_and_cached_read_rates(model)
-                rate = model_rates[0] if model_rates else 0.0
-            elif model:
-                norm_m = _claude_price_key(model, tier_data["claude_models"]) or "sonnet"
-                rate = (
-                    tier_data["claude_models"]
-                    .get(norm_m, tier_data["claude_models"].get("sonnet", {}))
-                    .get("input", fallback_rate)
-                )
-            else:
-                rate = fallback_rate
+            rate = _compression_row_rate(model, fallback_rate, tier_data)
             tokens_saved = orig - comp
             cost_saved = round(tokens_saved * rate / 1_000_000, 6)
 
@@ -18835,10 +18843,11 @@ def _session_mix_input_terms(*model_usage_blobs):
 _REPRICE_SKIP_EVENT_TYPES = frozenset({"resume_lean"})
 
 
-def _session_model_reprice(conn, cutoff):
+def _session_model_reprice(conn, cutoff, session_uuid=None, by_day=False):
     """Per-event_type USD correction from repricing savings_events at each event's
     OWN session model mix. Returns (deltas_by_event_type, repriced_tokens,
-    unmeasured_tokens).
+    unmeasured_tokens). With *session_uuid* only that session's rows count; with
+    *by_day* the deltas are keyed (local YYYY-MM-DD, event_type).
 
     THE DEFECT THIS REPAIRS. _log_savings_event stamps every row with
     _resolve_session_model(), which falls back to "sonnet" whenever the session
@@ -18880,18 +18889,29 @@ def _session_model_reprice(conn, cutoff):
             return {}, 0, 0
         mu = "s.model_usage_json" if "model_usage_json" in sl_cols else "NULL"
         amu = "s.all_model_usage_json" if "all_model_usage_json" in sl_cols else "NULL"
+        # by_day / session_uuid serve the status-bar buckets. The delta is linear
+        # in (tokens, cost) per session, so splitting by local day sums back to
+        # exactly the window delta.
+        day_col = "substr(e.timestamp, 1, 10)" if by_day else "NULL"
+        where = "WHERE e.timestamp >= ? "
+        params = [cutoff]
+        if session_uuid is not None:
+            # Same rows as the savings buckets (non-UUID ids live in session_id).
+            # Those rows have no session_uuid to join, so they stay unmeasured here.
+            where += "AND (e.session_uuid = ? OR (e.session_uuid IS NULL AND e.session_id = ?)) "
+            params.extend([session_uuid, session_uuid])
         rows = conn.execute(
-            "SELECT e.event_type, SUM(e.tokens_saved), SUM(e.cost_saved_usd), "
+            "SELECT " + day_col + ", e.event_type, SUM(e.tokens_saved), SUM(e.cost_saved_usd), "
             + mu + ", " + amu + " "
             "FROM savings_events e "
             "LEFT JOIN session_log s ON e.session_uuid = s.session_uuid "
-            "WHERE e.timestamp >= ? "
-            "GROUP BY e.event_type, e.session_uuid",
-            (cutoff,),
+            + where +
+            "GROUP BY " + ("1, " if by_day else "") + "e.event_type, e.session_uuid",
+            tuple(params),
         ).fetchall()
     except (sqlite3.Error, TypeError, ValueError):
         return {}, 0, 0
-    for event_type, tok, cost, mu_json, amu_json in rows:
+    for day, event_type, tok, cost, mu_json, amu_json in rows:
         if event_type in _REPRICE_SKIP_EVENT_TYPES:
             continue  # non-input-rate class; keep the event-time price verbatim
         try:
@@ -18910,7 +18930,8 @@ def _session_model_reprice(conn, cutoff):
         # rate, so a fully-unpriced session yields a zero delta by construction.
         delta = sum(sh * (rate - event_rate) for sh, rate in terms) * tok / 1_000_000.0
         if delta:
-            deltas[event_type] = deltas.get(event_type, 0.0) + delta
+            key = (day, event_type) if by_day else event_type
+            deltas[key] = deltas.get(key, 0.0) + delta
         repriced_tokens += tok
     return deltas, repriced_tokens, unmeasured_tokens
 
@@ -19559,6 +19580,141 @@ def _dashboard_savings_data(days=30, include_billing_mode=False, fail_open=False
 
 
 
+def _net_realized_savings(rows, reprice_deltas):
+    """Net savings_events aggregates into the REALIZED figure.
+
+    The one netting rule shared by the window headline (_get_savings_summary)
+    and the status-bar per-session / per-day buckets (_realized_savings_buckets),
+    so the two can never drift. *rows* is an iterable of
+    (event_type, events, tokens_saved, cost_saved_usd); *reprice_deltas* maps
+    event_type -> USD correction from _session_model_reprice for the SAME rows.
+
+    Returns (by_category, total_tokens, total_cost, total_events, popped,
+    repriced_to_session_mix) where *popped* holds the entries relocated out of
+    the realized total (setup_optimization, mcp_cap, hint_followed,
+    verbosity_steer, resume_lean), each an entry dict or None.
+    """
+    by_category = {}
+    total_tokens = 0
+    total_cost = 0.0
+    total_events = 0
+    for event_type, cnt, tok, cost in rows:
+        by_category[event_type] = {
+            "events": cnt,
+            "tokens_saved": tok or 0,
+            "cost_saved_usd": round(cost or 0.0, 4),
+        }
+        total_tokens += tok or 0
+        total_cost += cost or 0.0
+        total_events += cnt
+
+    # Apply the model-mix repair BEFORE every relocation and netting rule
+    # below, so the pops (setup_optimization, mcp_cap, hint_followed,
+    # verbosity_steer) and the tool_archive re-expand netting all operate on
+    # corrected dollars and the realized total stays internally consistent.
+    # Token COUNTS are never touched -- this is a rate correction only.
+    repriced_to_session_mix = False
+    for _event_type, _delta in reprice_deltas.items():
+        _entry = by_category.get(_event_type)
+        if not _entry:
+            continue
+        _entry["cost_saved_usd"] = round(
+            float(_entry.get("cost_saved_usd", 0.0) or 0.0) + _delta, 4)
+        total_cost += _delta
+        repriced_to_session_mix = True
+
+    # A1: setup_optimization (the one-time prefix trim credited by `compare`)
+    # double-counts with structural_savings, which credits the SAME trim as a
+    # perpetual cache annuity. Structural is the correct ongoing model, so the
+    # one-time event is relocated OUT of the realized total into a separate
+    # one_time_setup line (clearly a one-shot, never summed with the annuity).
+    one_time = by_category.pop("setup_optimization", None)
+    if one_time:
+        total_tokens -= int(one_time.get("tokens_saved", 0) or 0)
+        total_cost -= float(one_time.get("cost_saved_usd", 0.0) or 0.0)
+        total_events -= int(one_time.get("events", 0) or 0)
+
+    # A3: mcp_cap is a hardcoded-ratio ESTIMATE of Claude Code's own MCP-output
+    # truncation (the pre-cap size is invisible to us). It must not sit inside
+    # the measured realized total. Relocate it to the estimated tier; the
+    # three-tier rule keeps it from ever being summed with realized tool_archive.
+    mcp_cap_est = by_category.pop("mcp_cap", None)
+    if mcp_cap_est:
+        total_tokens -= int(mcp_cap_est.get("tokens_saved", 0) or 0)
+        total_cost -= float(mcp_cap_est.get("cost_saved_usd", 0.0) or 0.0)
+        total_events -= int(mcp_cap_est.get("events", 0) or 0)
+
+    # U-G: hint_followed is a DETERMINISTICALLY-TRIGGERED event (a proactive
+    # hint surfaced a file and the agent then read it) but its avoided-search
+    # MAGNITUDE is a conservative estimate. The trigger is observed; the size
+    # is not metered. So it belongs in the estimated tier, never the realized
+    # counted total. Relocate it exactly like mcp_cap.
+    hint_followed_est = by_category.pop("hint_followed", None)
+    if hint_followed_est:
+        total_tokens -= int(hint_followed_est.get("tokens_saved", 0) or 0)
+        total_cost -= float(hint_followed_est.get("cost_saved_usd", 0.0) or 0.0)
+        total_events -= int(hint_followed_est.get("events", 0) or 0)
+
+    # verbosity_steer: the UserPromptSubmit nudge is a deterministic trigger
+    # but the output-token reduction is an ESTIMATE (we can't measure the
+    # counterfactual output). Relocate to estimated tier, same as mcp_cap /
+    # hint_followed. The trigger is observed; the magnitude is not metered.
+    verbosity_steer_est = by_category.pop("verbosity_steer", None)
+    if verbosity_steer_est:
+        total_tokens -= int(verbosity_steer_est.get("tokens_saved", 0) or 0)
+        total_cost -= float(verbosity_steer_est.get("cost_saved_usd", 0.0) or 0.0)
+        total_events -= int(verbosity_steer_est.get("events", 0) or 0)
+
+    # resume_lean is a COUNTERFACTUAL --
+    # the cold `claude --resume` the user would otherwise have run -- not a
+    # removal of tokens already in flight (260/370 real events fired on the
+    # best-guess "continue" path). v5.13.1 fixed its magnitude (target's
+    # real last-turn context) and rate (cache-read when the cache is still
+    # warm, 1h cache-write when cold), but the trigger stays counterfactual,
+    # so it must not sit inside the measured counted total. Relocate to the
+    # estimated tier exactly like mcp_cap. savings_events has no tier
+    # column: this pop IS the tier=estimated stamp.
+    resume_lean_est = by_category.pop("resume_lean", None)
+    if resume_lean_est:
+        total_tokens -= int(resume_lean_est.get("tokens_saved", 0) or 0)
+        total_cost -= float(resume_lean_est.get("cost_saved_usd", 0.0) or 0.0)
+        total_events -= int(resume_lean_est.get("events", 0) or 0)
+
+    # B6: net tool-archive re-expansions out of the tool_archive credit. A
+    # re-popped result didn't stay collapsed, so its eager credit is reversed
+    # (floored at 0). tool_archive_reexpand is a DEBIT, never its own savings
+    # line, so it is removed from by_category and its spurious positive
+    # contribution backed out of the totals. The remaining tool_archive figure
+    # IS the measured progressive-disclosure win (collapsed and stayed so).
+    reexpand = by_category.pop("tool_archive_reexpand", None)
+    if reexpand:
+        r_tok = int(reexpand.get("tokens_saved", 0) or 0)
+        r_cost = float(reexpand.get("cost_saved_usd", 0.0) or 0.0)
+        r_events = int(reexpand.get("events", 0) or 0)
+        ta = by_category.get("tool_archive")
+        c_tok = int(ta["tokens_saved"]) if ta else 0
+        c_cost = float(ta["cost_saved_usd"]) if ta else 0.0
+        net_tok = max(0, c_tok - r_tok)
+        net_cost = max(0.0, c_cost - r_cost)
+        if ta:
+            ta["tokens_saved"] = net_tok
+            ta["cost_saved_usd"] = round(net_cost, 4)
+        # Back out the debit's own positive AND the reversed over-credit.
+        total_tokens += (net_tok - c_tok) - r_tok
+        total_cost += (net_cost - c_cost) - r_cost
+        total_events -= r_events  # re-expand rows are not savings events
+
+    popped = {
+        "setup_optimization": one_time,
+        "mcp_cap": mcp_cap_est,
+        "hint_followed": hint_followed_est,
+        "verbosity_steer": verbosity_steer_est,
+        "resume_lean": resume_lean_est,
+    }
+    return (by_category, total_tokens, total_cost, total_events, popped,
+            repriced_to_session_mix)
+
+
 def _get_savings_summary(days=30, since=None):
     """Query savings events and return a summary dict.
 
@@ -19588,115 +19744,13 @@ def _get_savings_summary(days=30, since=None):
         finally:
             conn.close()
 
-        by_category = {}
-        total_tokens = 0
-        total_cost = 0.0
-        total_events = 0
-        for event_type, cnt, tok, cost in rows:
-            by_category[event_type] = {
-                "events": cnt,
-                "tokens_saved": tok or 0,
-                "cost_saved_usd": round(cost or 0.0, 4),
-            }
-            total_tokens += tok or 0
-            total_cost += cost or 0.0
-            total_events += cnt
-
-        # Apply the model-mix repair BEFORE every relocation and netting rule
-        # below, so the pops (setup_optimization, mcp_cap, hint_followed,
-        # verbosity_steer) and the tool_archive re-expand netting all operate on
-        # corrected dollars and the realized total stays internally consistent.
-        # Token COUNTS are never touched -- this is a rate correction only.
-        repriced_to_session_mix = False
-        for _event_type, _delta in reprice_deltas.items():
-            _entry = by_category.get(_event_type)
-            if not _entry:
-                continue
-            _entry["cost_saved_usd"] = round(
-                float(_entry.get("cost_saved_usd", 0.0) or 0.0) + _delta, 4)
-            total_cost += _delta
-            repriced_to_session_mix = True
-
-        # A1: setup_optimization (the one-time prefix trim credited by `compare`)
-        # double-counts with structural_savings, which credits the SAME trim as a
-        # perpetual cache annuity. Structural is the correct ongoing model, so the
-        # one-time event is relocated OUT of the realized total into a separate
-        # one_time_setup line (clearly a one-shot, never summed with the annuity).
-        one_time = by_category.pop("setup_optimization", None)
-        if one_time:
-            total_tokens -= int(one_time.get("tokens_saved", 0) or 0)
-            total_cost -= float(one_time.get("cost_saved_usd", 0.0) or 0.0)
-            total_events -= int(one_time.get("events", 0) or 0)
-
-        # A3: mcp_cap is a hardcoded-ratio ESTIMATE of Claude Code's own MCP-output
-        # truncation (the pre-cap size is invisible to us). It must not sit inside
-        # the measured realized total. Relocate it to the estimated tier; the
-        # three-tier rule keeps it from ever being summed with realized tool_archive.
-        mcp_cap_est = by_category.pop("mcp_cap", None)
-        if mcp_cap_est:
-            total_tokens -= int(mcp_cap_est.get("tokens_saved", 0) or 0)
-            total_cost -= float(mcp_cap_est.get("cost_saved_usd", 0.0) or 0.0)
-            total_events -= int(mcp_cap_est.get("events", 0) or 0)
-
-        # U-G: hint_followed is a DETERMINISTICALLY-TRIGGERED event (a proactive
-        # hint surfaced a file and the agent then read it) but its avoided-search
-        # MAGNITUDE is a conservative estimate. The trigger is observed; the size
-        # is not metered. So it belongs in the estimated tier, never the realized
-        # counted total. Relocate it exactly like mcp_cap.
-        hint_followed_est = by_category.pop("hint_followed", None)
-        if hint_followed_est:
-            total_tokens -= int(hint_followed_est.get("tokens_saved", 0) or 0)
-            total_cost -= float(hint_followed_est.get("cost_saved_usd", 0.0) or 0.0)
-            total_events -= int(hint_followed_est.get("events", 0) or 0)
-
-        # verbosity_steer: the UserPromptSubmit nudge is a deterministic trigger
-        # but the output-token reduction is an ESTIMATE (we can't measure the
-        # counterfactual output). Relocate to estimated tier, same as mcp_cap /
-        # hint_followed. The trigger is observed; the magnitude is not metered.
-        verbosity_steer_est = by_category.pop("verbosity_steer", None)
-        if verbosity_steer_est:
-            total_tokens -= int(verbosity_steer_est.get("tokens_saved", 0) or 0)
-            total_cost -= float(verbosity_steer_est.get("cost_saved_usd", 0.0) or 0.0)
-            total_events -= int(verbosity_steer_est.get("events", 0) or 0)
-
-        # resume_lean is a COUNTERFACTUAL --
-        # the cold `claude --resume` the user would otherwise have run -- not a
-        # removal of tokens already in flight (260/370 real events fired on the
-        # best-guess "continue" path). v5.13.1 fixed its magnitude (target's
-        # real last-turn context) and rate (cache-read when the cache is still
-        # warm, 1h cache-write when cold), but the trigger stays counterfactual,
-        # so it must not sit inside the measured counted total. Relocate to the
-        # estimated tier exactly like mcp_cap. savings_events has no tier
-        # column: this pop IS the tier=estimated stamp.
-        resume_lean_est = by_category.pop("resume_lean", None)
-        if resume_lean_est:
-            total_tokens -= int(resume_lean_est.get("tokens_saved", 0) or 0)
-            total_cost -= float(resume_lean_est.get("cost_saved_usd", 0.0) or 0.0)
-            total_events -= int(resume_lean_est.get("events", 0) or 0)
-
-        # B6: net tool-archive re-expansions out of the tool_archive credit. A
-        # re-popped result didn't stay collapsed, so its eager credit is reversed
-        # (floored at 0). tool_archive_reexpand is a DEBIT, never its own savings
-        # line, so it is removed from by_category and its spurious positive
-        # contribution backed out of the totals. The remaining tool_archive figure
-        # IS the measured progressive-disclosure win (collapsed and stayed so).
-        reexpand = by_category.pop("tool_archive_reexpand", None)
-        if reexpand:
-            r_tok = int(reexpand.get("tokens_saved", 0) or 0)
-            r_cost = float(reexpand.get("cost_saved_usd", 0.0) or 0.0)
-            r_events = int(reexpand.get("events", 0) or 0)
-            ta = by_category.get("tool_archive")
-            c_tok = int(ta["tokens_saved"]) if ta else 0
-            c_cost = float(ta["cost_saved_usd"]) if ta else 0.0
-            net_tok = max(0, c_tok - r_tok)
-            net_cost = max(0.0, c_cost - r_cost)
-            if ta:
-                ta["tokens_saved"] = net_tok
-                ta["cost_saved_usd"] = round(net_cost, 4)
-            # Back out the debit's own positive AND the reversed over-credit.
-            total_tokens += (net_tok - c_tok) - r_tok
-            total_cost += (net_cost - c_cost) - r_cost
-            total_events -= r_events  # re-expand rows are not savings events
+        (by_category, total_tokens, total_cost, total_events, popped,
+         repriced_to_session_mix) = _net_realized_savings(rows, reprice_deltas)
+        one_time = popped["setup_optimization"]
+        mcp_cap_est = popped["mcp_cap"]
+        hint_followed_est = popped["hint_followed"]
+        verbosity_steer_est = popped["verbosity_steer"]
+        resume_lean_est = popped["resume_lean"]
 
         daily_avg = total_cost / days if days > 0 else 0.0
 
@@ -30391,7 +30445,12 @@ _CHECKPOINT_MAX_FILES = _int_env("TOKEN_OPTIMIZER_CHECKPOINT_FILES", 10)
 # common stop/end triggers and produced 0 restores; checkpoint freshness for
 # fire-cooldown is handled separately by _CHECKPOINT_COOLDOWN_SECONDS.
 _CHECKPOINT_RETENTION_DAYS = _int_env("TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_DAYS", 7)
-_CHECKPOINT_RETENTION_MAX = _int_env("TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX", 50)
+# Retention is per session: each session keeps its newest few checkpoints plus
+# the newest of each trigger, so one busy session can never push another
+# session's checkpoints out. RETENTION_MAX is only a disk ceiling across all
+# sessions; under it, every session's newest checkpoint is the last to go.
+_CHECKPOINT_RETENTION_MAX = _int_env("TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX", 400)
+_CHECKPOINT_PER_SESSION = _int_env("TOKEN_OPTIMIZER_CHECKPOINT_PER_SESSION", 5)
 # Relevance gating: the lightweight prompt-continuity hint used to
 # inject a full multi-line `[RECOVERED DATA ...]` block for any prior session
 # scoring as low as 0.30, even when the prior session was on a DIFFERENT topic.
@@ -34725,7 +34784,7 @@ def _resumable_flag_path(sid):
     return QUALITY_CACHE_DIR / f"resumable-{safe}.json"
 
 
-def _write_resumable_flag(sid, checkpoint_path):
+def _write_resumable_flag(sid, checkpoint_path, relevant=False):
     """Record that a relevance-cleared checkpoint exists for this session.
 
     Best-effort, never raises: the flag is a UI nicety, not a correctness gate.
@@ -34736,8 +34795,11 @@ def _write_resumable_flag(sid, checkpoint_path):
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         import time as _t
+        # relevant: same-work (cwd) match or cleared the relevance bar, the
+        # same test the billed pointer uses; the desktop band shows only those.
         payload = json.dumps({"checkpoint": str(checkpoint_path),
-                              "ts": int(_t.time() * 1000)})
+                              "ts": int(_t.time() * 1000),
+                              "relevant": bool(relevant)})
         tmp = p.with_suffix(".json.tmp")
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(p)
@@ -35234,7 +35296,9 @@ def compact_restore(session_id=None, cwd=None, is_compact=False, new_session_onl
         # points at the strongest eligible candidate we can identify (cwd match >
         # relevance winner > most-recent eligible; candidates are recent-first).
         flag_target = chosen or best or candidates[0]
-        _write_resumable_flag(sid_safe, flag_target["path"])
+        flag_relevant = chosen is not None or (
+            best is not None and flag_target is best and best_score >= CHECKPOINT_RELEVANCE_THRESHOLD)
+        _write_resumable_flag(sid_safe, flag_target["path"], relevant=flag_relevant)
 
         # Billed pointer: fire only on a strong same-work (cwd) signal or when the
         # relevance winner clears the threshold. Otherwise stay silent -- the
@@ -37787,8 +37851,70 @@ def list_checkpoints(max_age_minutes=None):
     return checkpoints
 
 
+_CHECKPOINT_NAME_RE = re.compile(r"^(?P<sid>.+)-\d{8}-\d{6}(?:-(?P<trigger>[^.]+))?\.md$")
+
+
+def _checkpoint_session(filename):
+    """The session id a checkpoint filename belongs to, or the filename itself."""
+    match = _CHECKPOINT_NAME_RE.match(filename)
+    return match.group("sid") if match else filename
+
+
+def _checkpoints_to_prune(checkpoints, now=None, days=None, total_max=None, per_session=None):
+    """The checkpoints retention removes, from a newest-first list_checkpoints() list.
+
+    Pure, so every concurrent writer reaches the same answer from what it sees:
+    - older than the retention window: removed;
+    - per session: the newest `per_session`, plus the newest of each trigger
+      (restore prefers earlier, richer saves over late stop saves), are kept;
+    - over the disk ceiling: extra saves go oldest first, then sessions' newest
+      saves oldest first, so a session's newest checkpoint is the last to go.
+    A session's newest checkpoint is removed only by age or the ceiling, never
+    by another session's activity. A file a writer has not seen yet is never in
+    its list, so it cannot be removed by that writer.
+    """
+    now = now or datetime.now()
+    days = _CHECKPOINT_RETENTION_DAYS if days is None else days
+    total_max = max(1, _CHECKPOINT_RETENTION_MAX if total_max is None else total_max)
+    per_session = max(1, _CHECKPOINT_PER_SESSION if per_session is None else per_session)
+    cutoff = now - timedelta(days=days)
+
+    prune = [cp for cp in checkpoints if cp["created"] < cutoff]
+    newest, extra = [], []
+    seen = {}
+    for cp in checkpoints:
+        if cp["created"] < cutoff:
+            continue
+        sid = _checkpoint_session(cp["filename"])
+        kept = seen.setdefault(sid, {"count": 0, "triggers": set()})
+        trigger = cp.get("trigger") or "auto"
+        if kept["count"] == 0:
+            newest.append(cp)
+        elif kept["count"] < per_session or trigger not in kept["triggers"]:
+            extra.append(cp)
+        else:
+            prune.append(cp)
+            continue
+        kept["count"] += 1
+        kept["triggers"].add(trigger)
+
+    over = len(newest) + len(extra) - total_max
+    if over > 0:
+        drop_extra = extra[::-1][:over]
+        prune.extend(drop_extra)
+        over -= len(drop_extra)
+    if over > 0:
+        prune.extend(newest[::-1][:over])
+    return prune
+
+
 def _cleanup_checkpoints():
-    """Remove old checkpoints beyond retention limits."""
+    """Remove checkpoints beyond retention limits (see _checkpoints_to_prune).
+
+    One bounded pass with no retries. Concurrent runs are safe: each removes
+    only files it listed, a missing file is skipped, and every run keeps the
+    newest checkpoint of each session it sees.
+    """
     if not CHECKPOINT_DIR.exists():
         return
 
@@ -37796,24 +37922,16 @@ def _cleanup_checkpoints():
     if not checkpoints:
         return
 
-    cutoff = datetime.now() - timedelta(days=_CHECKPOINT_RETENTION_DAYS)
-    removed = 0
-
-    for i, cp in enumerate(checkpoints):
-        # Keep up to max, remove if beyond max OR older than retention
-        if i >= _CHECKPOINT_RETENTION_MAX or cp["created"] < cutoff:
-            try:
-                cp["path"].unlink()
-                # Also delete sibling JSON sidecar if present.
-                sidecar = cp["path"].with_suffix(".json")
-                if sidecar.exists():
-                    try:
-                        sidecar.unlink()
-                    except OSError:
-                        pass
-                removed += 1
-            except OSError:
-                pass
+    for cp in _checkpoints_to_prune(checkpoints):
+        try:
+            cp["path"].unlink()
+        except OSError:
+            continue
+        # Also delete the sibling JSON sidecar if present.
+        try:
+            cp["path"].with_suffix(".json").unlink()
+        except OSError:
+            pass
 
 
 def _cleanup_quality_cache():
@@ -37833,7 +37951,8 @@ def _cleanup_quality_cache():
         # `once-*.json` are the per-session run-once guard markers:
         # three per session, never otherwise cleaned, so age them out here on the
         # same retention window as the quality-cache snapshots.
-        for pattern in ("quality-cache-*.json", "once-*.json"):
+        # `resumable-*.json` are the per-session resumable flags (one per session).
+        for pattern in ("quality-cache-*.json", "once-*.json", "resumable-*.json"):
             for f in cache_dir.glob(pattern):
                 try:
                     if f.stat().st_mtime < cutoff:
@@ -38433,6 +38552,27 @@ class _HookTimeout(BaseException):
 def _install_hook_budget(seconds=8, on_timeout=None):
     """Start the cross-platform hard wall-clock guard."""
     return HookDeadline(seconds, on_timeout=on_timeout).start()
+
+
+_COMPACT_CAPTURE_BUDGET_DEFAULT_S = 8
+_COMPACT_CAPTURE_BUDGET_MAX_S = 60
+
+
+def _compact_capture_budget_seconds(args):
+    """Wall-clock budget for `compact-capture`, from `--budget-seconds N`.
+
+    Hooks pass nothing and keep the 8 s default. A missing, unreadable or
+    non-positive value gives the default; anything above 60 s is capped at 60."""
+    try:
+        argv = list(args or ())
+        if "--budget-seconds" in argv:
+            i = argv.index("--budget-seconds")
+            value = float(argv[i + 1])
+            if value == value and value > 0:  # rejects NaN
+                return min(value, float(_COMPACT_CAPTURE_BUDGET_MAX_S))
+    except (IndexError, ValueError, TypeError):
+        pass
+    return _COMPACT_CAPTURE_BUDGET_DEFAULT_S
 
 
 def _dashboard_hook_budget_seconds(default=20):
@@ -39087,6 +39227,82 @@ _LOOP_LAST_MESSAGES = 4
 # _maybe_nudge, _maybe_loop_warning, or _maybe_quality_warn MUST be registered
 # here — a sibling key silently missing from this set is exactly what broke the
 # nudge follow-through credit (A6).
+_COMPACT_BUMP_WINDOW_S = 60
+_COMPACT_BOUNDARY_FRESH_S = 120
+_COMPACT_TAIL_BYTES = 4 << 20
+
+
+def _recent_compact_boundary(path, within_s=_COMPACT_BOUNDARY_FRESH_S, now=None):
+    """True when the transcript's newest compact_boundary row is under `within_s` old.
+
+    Then the compaction the PostCompact hook is reporting is already in the parse,
+    and counting it again would double it. Reads only the tail of the file.
+    """
+    try:
+        with open(path, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - _COMPACT_TAIL_BYTES))
+            tail = fh.read()
+    except (OSError, TypeError, ValueError):
+        return False
+    # The boundary row itself, not the words inside a message: same marker as the
+    # counter, and the parsed row must be a system compact_boundary.
+    i = tail.rfind(_COMPACT_MARK)
+    while i >= 0:
+        start = tail.rfind(b"\n", 0, i) + 1
+        end = tail.find(b"\n", i)
+        try:
+            row = json.loads(tail[start:end if end >= 0 else len(tail)])
+        except Exception:
+            row = None
+        if isinstance(row, dict) and row.get("type") == "system" and row.get("subtype") == "compact_boundary":
+            break
+        i = tail.rfind(_COMPACT_MARK, 0, start)
+    else:
+        return False
+    try:
+        ts = _keepwarm_iso_to_epoch(row.get("timestamp"))
+    except Exception:
+        return False
+    if ts is None:
+        return False
+    now = time.time() if now is None else now
+    return 0 <= now - ts <= within_s
+
+
+def _settled_compactions(parsed, prev_result, post_compact, now=None):
+    """The session's compaction count, never lower than what was already known.
+
+    Claude Code appends the compact_boundary row to the transcript after the
+    PostCompact hooks run, so the PostCompact refresh parses a transcript that
+    does not show the compaction yet. That refresh therefore counts one more
+    than before when the parse has not caught up, once per compaction (a
+    second PostCompact within a minute is the same one). A later parse that
+    sees the boundary agrees with that count rather than adding to it. The
+    caller passes post_compact=False when the boundary is already in the
+    transcript. Two real compactions inside one minute read as one until the
+    next parse sees both boundaries, which then corrects the count.
+    """
+    try:
+        prev = max(0, int((prev_result or {}).get("compactions", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        prev = 0
+    try:
+        parsed = max(0, int(parsed or 0))
+    except (TypeError, ValueError, OverflowError):
+        parsed = 0
+    count = max(parsed, prev)
+    if post_compact and parsed <= prev:
+        now = time.time() if now is None else now
+        try:
+            last = float((prev_result or {}).get("_compact_bumped_at") or 0)
+        except (TypeError, ValueError, OverflowError):
+            last = 0.0
+        if now - last > _COMPACT_BUMP_WINDOW_S:
+            count = prev + 1
+    return count
+
+
 _CARRY_KEYS = (
     "_nudge_fill_pct_at_fire",
     "_nudge_fire_epoch",
@@ -39258,10 +39474,17 @@ def _maybe_fresh_session_nudge(result, cache_path, quality_data, quiet=False):
     if not (score < _FRESH_NUDGE_QUALITY_THRESHOLD and fill_pct >= _FRESH_NUDGE_MIN_FILL):
         return None
 
+    session_id = Path(cache_path).stem.replace("quality-cache-", "", 1) if cache_path else None
+    # The flag above lives in the quality cache, which other writes can replace
+    # (a lost race, an unreadable transcript). A marker file claimed with
+    # O_EXCL keeps "once per session" true whatever happens to the cache, and
+    # only one of two racing processes can claim it.
+    if _ran_once_this_session("fresh-nudge", session_id):
+        result["_fresh_nudge_fired"] = True
+        return None
     saved, _window = _fresh_session_savings_estimate(
         fill_pct, window=result.get("model_context_window"))
     result["_fresh_nudge_fired"] = True
-    session_id = Path(cache_path).stem.replace("quality-cache-", "", 1) if cache_path else None
     _log_compression_event(
         feature="fresh_session_nudge",
         session_id=session_id,
@@ -39453,7 +39676,7 @@ def _maybe_loop_warning(result, cache_path, quality_data, quiet=False):
     return None
 
 
-def _acquire_quality_lock(cache_path, acquire_timeout=0.15):
+def _acquire_quality_lock(cache_path, acquire_timeout=0.15, reclaim_released=False):
     """Bounded portable lock serializing quality_cache recompute+write.
 
     Returns a LeaseLock on success or False when unavailable/contended. The
@@ -39478,6 +39701,7 @@ def _acquire_quality_lock(cache_path, acquire_timeout=0.15):
         cache_path.with_suffix(".qlease"),
         deadline=current_deadline(),
         acquire_timeout=acquire_timeout,
+        reclaim_released=reclaim_released,
     )
     if not lock.acquire():
         return False
@@ -39490,7 +39714,7 @@ def _release_quality_lock(lock):
     lock.release()
 
 
-def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_jsonl=None, force=False, pure_time_throttle=False, session_id=None, warn=False):
+def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_jsonl=None, force=False, pure_time_throttle=False, session_id=None, warn=False, post_compact=False):
     """Run quality analysis and write score to cache file for status line.
 
     Skips analysis if cache is younger than throttle_seconds (unless force=True).
@@ -39580,7 +39804,14 @@ def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_
         if _bootstrapping
         else _float_env("TOKEN_OPTIMIZER_QUALITY_LOCK_TIMEOUT", 0.15)
     )
-    _qlock = _acquire_quality_lock(cache_path, acquire_timeout=_lock_timeout)
+    # The PostCompact refresh is the one recompute that must land (it records the
+    # compaction); the cohort reservation another hook's released lease leaves
+    # behind must not turn it away.
+    _qlock = (
+        _acquire_quality_lock(cache_path, acquire_timeout=_lock_timeout, reclaim_released=True)
+        if post_compact
+        else _acquire_quality_lock(cache_path, acquire_timeout=_lock_timeout)
+    )
     if _qlock is False:
         # Breadcrumb (was silent): a lost lease serves the STALE score on a refresh,
         # or writes NOTHING on a bootstrap -- the "ContextQ stuck / not showing"
@@ -39621,7 +39852,13 @@ def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_
         # Run quality analysis
         quality_data = _parse_jsonl_for_quality(filepath)
         if not quality_data:
-            # New/empty session - write a clean score to cache so stale score doesn't persist
+            # New/empty session - write a clean score to cache so stale score doesn't persist.
+            # A transcript the parser gives up on (very large) is not a new session: keep the
+            # compaction count it already had, so "never decreases" holds there too.
+            try:
+                _prev_empty = _read_quality_cache(cache_path) if cache_path.exists() else {}
+            except Exception:
+                _prev_empty = {}
             result = {
                 "score": 100,
                 "grade": "S",
@@ -39629,12 +39866,27 @@ def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_
                 "breakdown": {},
                 "total_messages": 0,
                 "decisions_found": 0,
-                "compactions": 0,
+                "compactions": _settled_compactions(
+                    0, _prev_empty or {}, post_compact and not _recent_compact_boundary(filepath)),
                 "turns": 0,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "session_file": Path(filepath).name,
                 "model_context_window": detect_context_window()[0],
             }
+            # Same bump bookkeeping as the full path: one count per compaction.
+            if (_prev_empty or {}).get("_compact_bumped_at"):
+                result["_compact_bumped_at"] = _prev_empty["_compact_bumped_at"]
+            # Keep the nudge and warning state too: dropping it re-arms nudges
+            # that already fired once the transcript parses again.
+            for carry_key in _CARRY_KEYS:
+                if carry_key in (_prev_empty or {}):
+                    result[carry_key] = _prev_empty[carry_key]
+            try:
+                _prev_n = int((_prev_empty or {}).get("compactions", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                _prev_n = 0
+            if post_compact and result["compactions"] > _prev_n:
+                result["_compact_bumped_at"] = time.time()
             _write_quality_cache(cache_path, result)
             return 100
 
@@ -39663,7 +39915,17 @@ def quality_cache(throttle_seconds=120, warn_threshold=70, quiet=False, session_
         # accurate. Routing the statusline through the same dedup would add
         # latency to every prompt for a number the user glances at.
         result["decisions_found"] = len(quality_data["decisions"])
-        result["compactions"] = quality_data["compactions"]
+        result["compactions"] = _settled_compactions(
+            quality_data["compactions"], prev_result,
+            post_compact and not _recent_compact_boundary(filepath))
+        try:
+            _prev_compactions = int(prev_result.get("compactions", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            _prev_compactions = 0
+        if post_compact and result["compactions"] > max(int(quality_data["compactions"] or 0), _prev_compactions):
+            result["_compact_bumped_at"] = time.time()
+        elif prev_result.get("_compact_bumped_at"):
+            result["_compact_bumped_at"] = prev_result["_compact_bumped_at"]
         result["turns"] = len([m for m in quality_data["messages"] if m[1] == "user"])
         result["timestamp"] = datetime.now(timezone.utc).isoformat()
         result["session_file"] = Path(filepath).name
@@ -45723,6 +45985,40 @@ def _progressive_disclosure_summary(days=30):
     return out
 
 
+def _merge_v5_compression(by_category, by_feature, fallback_cost_per_mtok):
+    """Merge realized v5 compression_events features into *by_category* in place.
+
+    Shared by _get_merged_savings and the status-bar buckets. Only known v5
+    features merge; a key savings_events already owns is skipped (dedup).
+    Returns the (tokens, cost_usd, events) added.
+    """
+    add_tok, add_cost, add_events = 0, 0.0, 0
+    for feature, fdata in by_feature.items():
+        if feature not in _V5_COMPRESSION_CATEGORIES:
+            continue  # only merge known v5 features; experimental keys stay out
+        if feature in by_category:
+            continue  # dedup: savings_events already owns this key
+        tokens_saved = int(fdata.get("tokens_saved", 0) or 0)
+        events = int(fdata.get("events", 0) or 0)
+        if tokens_saved <= 0 and events <= 0:
+            continue
+        # Prefer cost_saved_usd from _get_compression_summary (per-model pricing);
+        # fall back to the current-session rate for legacy NULL-model rows.
+        if "cost_saved_usd" in fdata and fdata["cost_saved_usd"] is not None:
+            cost_saved = round(float(fdata["cost_saved_usd"]), 4)
+        else:
+            cost_saved = round(tokens_saved * fallback_cost_per_mtok / 1_000_000, 4)
+        by_category[feature] = {
+            "events": events,
+            "tokens_saved": tokens_saved,
+            "cost_saved_usd": cost_saved,
+        }
+        add_tok += tokens_saved
+        add_cost += cost_saved
+        add_events += events
+    return add_tok, add_cost, add_events
+
+
 def _get_merged_savings(days=30, since=None):
     """Merge savings_events and compression_events into one unified savings view.
 
@@ -45751,29 +46047,11 @@ def _get_merged_savings(days=30, since=None):
     # is already priced correctly by _get_compression_summary's per-row rate.
     fallback_cost_per_mtok = _estimate_compression_cost_per_mtok()
 
-    for feature, fdata in compression.get("by_feature", {}).items():
-        if feature not in _V5_COMPRESSION_CATEGORIES:
-            continue  # only merge known v5 features; experimental keys stay out
-        if feature in by_category:
-            continue  # dedup: savings_events already owns this key
-        tokens_saved = int(fdata.get("tokens_saved", 0) or 0)
-        events = int(fdata.get("events", 0) or 0)
-        if tokens_saved <= 0 and events <= 0:
-            continue
-        # Prefer cost_saved_usd from _get_compression_summary (per-model pricing);
-        # fall back to the current-session rate for legacy NULL-model rows.
-        if "cost_saved_usd" in fdata and fdata["cost_saved_usd"] is not None:
-            cost_saved = round(float(fdata["cost_saved_usd"]), 4)
-        else:
-            cost_saved = round(tokens_saved * fallback_cost_per_mtok / 1_000_000, 4)
-        by_category[feature] = {
-            "events": events,
-            "tokens_saved": tokens_saved,
-            "cost_saved_usd": cost_saved,
-        }
-        total_tokens += tokens_saved
-        total_cost += cost_saved
-        total_events += events
+    _add_tok, _add_cost, _add_events = _merge_v5_compression(
+        by_category, compression.get("by_feature", {}), fallback_cost_per_mtok)
+    total_tokens += _add_tok
+    total_cost += _add_cost
+    total_events += _add_events
 
     # Structural (cumulative) savings — baseline delta × context loads since.
     structural = _compute_structural_savings(days=days)
@@ -45890,6 +46168,845 @@ def _get_merged_savings(days=30, since=None):
         # rates). Estimated tier, never in the realized total.
         "resume_lean_estimated": savings.get("resume_lean_estimated"),
     }
+
+
+# ---------------------------------------------------------------------------
+# status-bar: the desktop band's single read.
+#
+# One spawn answers everything the band needs from Token Optimizer's stores.
+# Savings are the slow part (~0.5 s warm, ~10 s cold on a large trends.db), so
+# they are served from a per-session JSON cache under SNAPSHOT_DIR/status-bar/
+# and refreshed by ONE detached child when the cache is older than 60 s. The
+# transcript and quality-cache fields are cheap and always read live.
+# ---------------------------------------------------------------------------
+
+_STATUS_BAR_SCHEMA = 1
+_STATUS_BAR_DAYS = 30
+_STATUS_BAR_CACHE_MAX_AGE_S = 60
+_STATUS_BAR_LOCK_STALE_S = 120
+# The detached refresh child reads its lock's owner token from this variable.
+_STATUS_BAR_LOCK_TOKEN_ENV = "TO_STATUS_BAR_LOCK_TOKEN"
+_STATUS_BAR_CACHE_RETENTION_S = 30 * 86400
+_STATUS_BAR_CHILD_BUDGET_S = 90
+_STATUS_BAR_TAIL_CHUNK = 1 << 20
+_STATUS_BAR_TAIL_MAX_BYTES = 16 << 20
+
+STATUS_BAR_HELP = """\
+measure.py status-bar --session <id> --json [--transcript PATH]
+
+One JSON read for the desktop status band. Always exits 0 with a JSON object;
+a missing or busy trends.db, or a missing transcript, gives nulls, not errors.
+
+Fields:
+  schema                 1
+  session_id             the sanitized session id
+  savings                null, or the object below
+    unit                 "tokens": the band shows tokens saved
+    session_tokens       this session's realized (metered) tokens saved
+    session_usd          the same in USD
+    daily                30 entries, oldest first, one per LOCAL day ending
+                         today: {"date": "YYYY-MM-DD", "tokens": int, "usd": float};
+                         zeros on days with no savings (metered only)
+    total_30d_usd        exactly _get_merged_savings(days=30)["total_cost_usd"],
+                         the realized metered figure (rolling 30 x 24 h)
+    total_30d_tokens     the dashboard's Tokens Saved headline for the same
+                         window: measured + estimated (_dashboard_saved_tokens);
+                         0 when nothing was measured, as the dashboard hides it
+    total_30d_measured_tokens  _get_merged_savings(days=30)["total_tokens"], the floor
+    computed_at          epoch seconds the savings were computed
+    The session figure and the daily entries are savings_events + realized
+    compression_events rows, netted by the same helpers as the headline
+    (model-mix reprice, estimated-tier relocations, tool_archive re-expand
+    netting, v5 dedup). The 30-day headline also carries structural and
+    estimated savings, which cannot be split by session or day, so the daily
+    entries need not add up to it. The band shows total_30d_tokens.
+  savings_state          "fresh" (cache <= 60 s old), "stale" (served from an
+                         older cache while a refresh runs), "loading" (no cache
+                         yet, refresh started), or "unavailable"
+  savings_age_s          age of the served savings in seconds, or null
+  savings_reason         one short reason when savings is null, else null
+  refresh_started        true when this call started the one detached refresh
+  last_request_epoch     epoch seconds of the last MAIN-thread assistant
+                         request in the transcript (subagent rows ignored)
+  cache_lifetime         "1h" | "5m" | null: the last measured cache-write
+                         lifetime on the main thread (null = unmeasured)
+  last_checkpoint_epoch  this session's newest checkpoint (quality cache or
+                         checkpoint file) across Token Optimizer's storage dirs
+  compactions            compact_boundary rows in the transcript, or null
+  earlier_checkpoint     {epoch, about} for the earlier session's checkpoint
+                         flagged as resumable for this one at start, or null
+
+Options:
+  --session ID     required: the Claude Code session id
+  --json           accepted for convention; output is always JSON
+  --transcript P   read this transcript instead of looking it up by id
+  --sync           compute savings now and rewrite the cache (the refresh child)
+"""
+
+
+def _status_bar_dir():
+    return SNAPSHOT_DIR / "status-bar"
+
+
+def _status_bar_key(session_id):
+    """A file-name-safe key for a session: long ids are shortened with a hash so a
+    file name never exceeds what the filesystem allows."""
+    sid = str(session_id)
+    if len(sid) <= 100:
+        return sid
+    return sid[:64] + "-" + hashlib.sha256(sid.encode("utf-8")).hexdigest()[:16]
+
+
+def _status_bar_cache_path(session_id):
+    return _status_bar_dir() / f"{_status_bar_key(session_id)}.json"
+
+
+def _status_bar_lock_path(session_id):
+    return _status_bar_dir() / f"{_status_bar_key(session_id)}.refresh.lock"
+
+
+def _realized_savings_buckets(conn, cutoff, session_uuid=None, by_day=False):
+    """Realized savings per bucket, netted exactly like the window headline.
+
+    Buckets are local days (savings_events / compression_events timestamps are
+    naive local ISO) when *by_day*, else one bucket keyed "". With
+    *session_uuid* only that session's rows count. Each bucket is
+    {"tokens": int, "usd": float, "events": int}. Raises sqlite3.Error so the
+    caller can tell a busy or broken DB from an empty one.
+    """
+    day_col = "substr(timestamp, 1, 10)" if by_day else "''"
+    where = "WHERE timestamp >= ? "
+    params = [cutoff]
+    if session_uuid is not None:
+        # Other runtimes' ids are not UUIDs: their rows keep the id in session_id.
+        where += "AND (session_uuid = ? OR (session_uuid IS NULL AND session_id = ?)) "
+        params.extend([session_uuid, session_uuid])
+    se_rows = conn.execute(
+        "SELECT " + day_col + ", event_type, COUNT(*), SUM(tokens_saved), "
+        "SUM(cost_saved_usd) FROM savings_events " + where +
+        "GROUP BY 1, event_type ORDER BY 4 DESC",
+        tuple(params),
+    ).fetchall()
+    ce_rows = conn.execute(
+        "SELECT " + day_col + ", feature, COUNT(*), SUM(original_tokens), "
+        "SUM(compressed_tokens), model FROM compression_events " + where +
+        "AND (tier IS NULL OR tier = 'measured') "
+        "GROUP BY 1, feature, model",
+        tuple(params),
+    ).fetchall()
+    deltas, _rt, _ut = _session_model_reprice(
+        conn, cutoff, session_uuid=session_uuid, by_day=True)
+
+    se_by_bucket = {}
+    for bucket, event_type, cnt, tok, cost in se_rows:
+        se_by_bucket.setdefault(bucket or "", []).append((event_type, cnt, tok, cost))
+    deltas_by_bucket = {}
+    for (day, event_type), delta in deltas.items():
+        key = (day or "") if by_day else ""
+        per = deltas_by_bucket.setdefault(key, {})
+        per[event_type] = per.get(event_type, 0.0) + delta
+
+    fallback_rate = _estimate_compression_cost_per_mtok()
+    tier_data = PRICING_TIERS.get(_load_pricing_tier(), PRICING_TIERS["anthropic"])
+    ce_by_bucket = {}
+    for bucket, feature, cnt, orig, comp, model in ce_rows:
+        tokens_saved = (orig or 0) - (comp or 0)
+        rate = _compression_row_rate(model, fallback_rate, tier_data)
+        feats = ce_by_bucket.setdefault(bucket or "", {})
+        entry = feats.setdefault(feature, {"events": 0, "tokens_saved": 0, "cost_saved_usd": 0.0})
+        entry["events"] += cnt or 0
+        entry["tokens_saved"] += tokens_saved
+        entry["cost_saved_usd"] = round(
+            entry["cost_saved_usd"] + round(tokens_saved * rate / 1_000_000, 6), 6)
+
+    out = {}
+    for bucket in set(se_by_bucket) | set(ce_by_bucket):
+        by_category, tok, cost, events, _popped, _rp = _net_realized_savings(
+            se_by_bucket.get(bucket, []), deltas_by_bucket.get(bucket, {}))
+        a_tok, a_cost, a_events = _merge_v5_compression(
+            by_category, ce_by_bucket.get(bucket, {}), fallback_rate)
+        out[bucket] = {
+            "tokens": int(tok + a_tok),
+            "usd": round(cost + a_cost, 4),
+            "events": int(events + a_events),
+        }
+    return out
+
+
+def _open_trends_db_readonly(timeout=2.0):
+    """Read-only connection to trends.db; never creates or migrates it."""
+    uri = Path(TRENDS_DB).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=timeout)
+    conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    return conn
+
+
+def _dashboard_saved_tokens(summary):
+    """The dashboard's Tokens Saved headline: measured plus the estimated tier.
+
+    Mirrors tokensSavedCardHtml in assets/dashboard.html exactly (same fields,
+    same `a || b` fallbacks), so the status bar and the dashboard never disagree.
+    """
+    s = summary or {}
+
+    def num(v):
+        try:
+            return max(0, int(float(v or 0)))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def tok(obj):
+        try:
+            return num((obj or {}).get("tokens_saved", 0))
+        except AttributeError:
+            return 0
+
+    estimated = (tok(s.get("mcp_cap_estimated"))
+                 + tok(s.get("hint_followed") or s.get("hint_followed_estimated"))
+                 + tok(s.get("verbosity_steer") or s.get("verbosity_steer_estimated"))
+                 + tok(s.get("resume_lean_estimated")))
+    measured = num(s.get("total_tokens", 0))
+    # The dashboard draws no Tokens Saved card at all when nothing was measured.
+    return (measured + estimated if measured > 0 else 0), measured
+
+
+def _status_bar_savings_or_reason(session_id, _retried=False):
+    """Compute the savings object. Returns (savings_dict, None) or (None, reason)."""
+    if not Path(TRENDS_DB).exists():
+        return None, "no savings recorded yet"
+    today = datetime.now().date()
+    first_day = today - timedelta(days=_STATUS_BAR_DAYS - 1)
+    cutoff = datetime(first_day.year, first_day.month, first_day.day).isoformat()
+    try:
+        conn = _open_trends_db_readonly()
+        try:
+            # One read transaction: both bucket reads see the same committed rows (the
+            # 30-day headline below runs on its own connection, as the dashboard's does).
+            conn.execute("BEGIN")
+            days = _realized_savings_buckets(conn, cutoff, by_day=True)
+            window = _realized_savings_buckets(conn, cutoff).get("", {"tokens": 0})
+            sess = _realized_savings_buckets(conn, "", session_uuid=session_id).get(
+                "", {"tokens": 0, "usd": 0.0})
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "locked" in msg or "busy" in msg:
+            return None, "savings database busy"
+        if "no such column" in msg or "no such table" in msg:
+            # A database from before these columns: the normal writer migrates it once.
+            try:
+                migrated = _init_trends_db()
+                if migrated is not None:
+                    migrated.close()
+            except Exception:
+                return None, "savings database unreadable"
+            if _retried:
+                return None, "savings database unreadable"
+            return _status_bar_savings_or_reason(session_id, _retried=True)
+        return None, "savings database unreadable"
+    except (sqlite3.Error, OSError, ValueError):
+        return None, "savings database unreadable"
+    daily = []
+    for i in range(_STATUS_BAR_DAYS):
+        d = (first_day + timedelta(days=i)).isoformat()
+        b = days.get(d, {})
+        daily.append({"date": d, "tokens": int(b.get("tokens", 0)),
+                      "usd": float(b.get("usd", 0.0))})
+    headline = _get_merged_savings(days=_STATUS_BAR_DAYS)
+    shown, measured = _dashboard_saved_tokens(headline)
+    # The headline pass fails open to zeros; when the window, netted the way the
+    # headline nets it, shows savings but the headline is zero, it failed: say so
+    # rather than cache a false 0. Single days are not compared, since a debit on
+    # one day can honestly cancel savings on another.
+    if measured == 0 and int(window.get("tokens", 0)) > 0:
+        return None, "savings database busy"
+    return {
+        "unit": "tokens",
+        "session_tokens": int(sess.get("tokens", 0)),
+        "session_usd": float(sess.get("usd", 0.0)),
+        "daily": daily,
+        "total_30d_usd": headline["total_cost_usd"],
+        # The dashboard's headline (measured + estimated); the measured floor beside it.
+        "total_30d_tokens": shown,
+        "total_30d_measured_tokens": measured,
+        "computed_at": time.time(),
+    }, None
+
+
+def _status_bar_write_cache(session_id, savings, reason):
+    d = _status_bar_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    path = _status_bar_cache_path(session_id)
+    if savings is None:
+        # A failed refresh keeps the last good figures (they read as stale), never null them.
+        prior = _status_bar_read_cache(session_id)
+        if prior is not None and prior.get("savings") is not None:
+            return
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({
+        "schema": _STATUS_BAR_SCHEMA,
+        "computed_at": time.time(),
+        "savings": savings,
+        "reason": reason,
+    }), encoding="utf-8")
+    os.replace(tmp, path)
+    # Bound the directory: drop caches for sessions untouched for 30 days.
+    cutoff = time.time() - _STATUS_BAR_CACHE_RETENTION_S
+    orphan_cutoff = time.time() - 86400
+    try:
+        for f in d.iterdir():
+            try:
+                name = f.name
+                # Temp files and set-aside locks left by a crash go after a day.
+                orphan = name.endswith((".tmp", ".stale", ".release"))
+                if (orphan and f.stat().st_mtime < orphan_cutoff) or (
+                        name.endswith(".json") and f.stat().st_mtime < cutoff):
+                    f.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _status_bar_read_cache(session_id):
+    try:
+        data = json.loads(_status_bar_cache_path(session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("computed_at"), (int, float)):
+        return None
+    return data
+
+
+def _status_bar_start_refresh(session_id):
+    """Start ONE detached `status-bar --sync` child. Returns True if started.
+
+    A lock file (O_EXCL) makes concurrent callers start at most one child; the
+    child removes it when done, and a lock older than 120 s counts as abandoned.
+    The lock holds a random owner token, passed to the child in the
+    TO_STATUS_BAR_LOCK_TOKEN environment variable; the child deletes the lock
+    only while it still holds that token.
+    """
+    token = _status_bar_acquire_lock(session_id)
+    if token is None:
+        return False
+    # The child releases the lock only if it still holds this token, so a child
+    # that outlives its lock never deletes a newer caller's lock.
+    proc = spawn_detached(
+        [_detached_python_exe(), str(MEASURE_PY_PATH), "status-bar",
+         "--session", session_id, "--sync", "--release-lock"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={**os.environ, _STATUS_BAR_LOCK_TOKEN_ENV: token})
+    if proc is None:
+        _log_spawn_failure("status-bar refresh spawn failed")
+        _status_bar_release_lock(session_id, token)
+        return False
+    return True
+
+
+def _status_bar_acquire_lock(session_id):
+    """Take the session's refresh lock; its owner token, or None when it is held."""
+    lock = _status_bar_lock_path(session_id)
+    token = os.urandom(16).hex()
+    fd = None
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if time.time() - lock.stat().st_mtime < _STATUS_BAR_LOCK_STALE_S:
+                return None
+            # Take an abandoned lock over by renaming it aside. Rename is atomic,
+            # so when two callers race only one moves the file; the other gets
+            # FileNotFoundError and backs off instead of deleting the winner's lock.
+            quarantine = lock.with_name(
+                f"{lock.name}.{os.getpid()}.{time.time_ns()}.stale")
+            try:
+                os.rename(str(lock), str(quarantine))
+            except OSError:
+                return None
+            try:
+                moved_fresh = (time.time() - os.stat(str(quarantine)).st_mtime
+                               < _STATUS_BAR_LOCK_STALE_S)
+            except OSError:
+                moved_fresh = False
+            if moved_fresh:
+                # Another caller replaced the stale lock between our check and the
+                # rename, so we moved its live lock. Put it back without
+                # overwriting anything (link fails if the name is taken) and back off.
+                _status_bar_put_back(quarantine, lock)
+                try:
+                    quarantine.unlink()
+                except OSError:
+                    pass
+                return None
+            try:
+                quarantine.unlink()
+            except OSError:
+                pass
+            try:
+                fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                return None
+        written = os.write(fd, token.encode("ascii"))
+        os.close(fd)
+        fd = None
+        if written != len(token):
+            # A short write leaves a lock nobody can prove they own: remove ours now.
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+            return None
+        return token
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+        return None
+
+
+def _status_bar_release_lock(session_id, token):
+    """Delete the refresh lock only when it still holds `token`. Never raises.
+
+    The lock is moved aside first (one atomic rename) and only then checked, so a
+    lock another process created after ours is never deleted by mistake: when the
+    moved file is not ours it goes back, unless a newer lock already took its name.
+    """
+    if not token:
+        return False
+    lock = _status_bar_lock_path(session_id)
+    aside = lock.with_name(f"{lock.name}.{os.getpid()}.{time.time_ns()}.release")
+    try:
+        os.rename(str(lock), str(aside))
+    except OSError:
+        return False
+    try:
+        mine = aside.read_text(encoding="ascii", errors="replace").strip() == token
+    except OSError:
+        mine = False
+    if not mine:
+        _status_bar_put_back(aside, lock)
+    try:
+        aside.unlink()
+    except OSError:
+        pass
+    return mine
+
+
+def _status_bar_put_back(aside, lock):
+    """Return a lock moved aside to its name, never over a newer one.
+
+    The caller still removes `aside` afterwards. A hard link puts it back only
+    while the name is free. Without hard links it is dropped: a check-then-rename
+    could replace a newer lock, and losing an old one only allows a duplicate
+    refresh.
+    """
+    try:
+        os.link(str(aside), str(lock))
+    except (OSError, AttributeError):
+        pass
+
+
+_COMPACT_MARK = b'"subtype":"compact_boundary"'
+
+
+def _status_bar_compactions(path, session_id=None):
+    """How many times this transcript was compacted (compact_boundary rows), or None.
+
+    Counts rows whose parsed JSON is a system compact_boundary (the same key can
+    sit inside a structured tool result). The quality cache's own count can lag
+    a compaction, and the band shows this number right after one. The transcript
+    only grows, so with a session id the count resumes after the last whole line
+    the previous call read (kept beside the status cache).
+    """
+    memo = None
+    if session_id:
+        try:
+            memo = _status_bar_dir() / f"compactions-{_status_bar_key(sanitize_session_id(session_id))}.json"
+        except Exception:
+            memo = None
+    start, count = 0, 0
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if memo is not None:
+        try:
+            m = json.loads(memo.read_text(encoding="utf-8"))
+            if m.get("path") == str(path) and 0 <= int(m.get("size", -1)) <= size:
+                start, count = int(m["size"]), int(m["count"])
+        except (OSError, ValueError, TypeError, KeyError):
+            start, count = 0, 0
+    try:
+        end = start
+        with open(path, "rb") as fh:
+            if start > 0:
+                # Resume only on a line boundary; anything else recounts from the top.
+                fh.seek(start - 1)
+                if fh.read(1) != b"\n":
+                    start, count, end = 0, 0, 0
+            fh.seek(start)
+            for line in fh:
+                if not line.endswith(b"\n"):
+                    break  # a row still being written: the next call reads it whole
+                end += len(line)
+                if _COMPACT_MARK not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(row, dict) and row.get("type") == "system" and row.get("subtype") == "compact_boundary":
+                    count += 1
+        if memo is not None:
+            try:
+                # Never written backwards: a slower reader that ended earlier leaves a newer memo alone.
+                try:
+                    cur = json.loads(memo.read_text(encoding="utf-8"))
+                    newer = cur.get("path") == str(path) and int(cur.get("size", -1)) > end
+                except (OSError, ValueError, TypeError):
+                    newer = False
+                if not newer:
+                    memo.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = memo.with_name(f".{memo.name}.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps({"path": str(path), "size": end, "count": count}), encoding="utf-8")
+                    os.replace(tmp, memo)
+            except OSError:
+                pass
+        return count
+    except OSError:
+        return None
+
+
+def _status_bar_transcript_state(path):
+    """(last_request_epoch, cache_lifetime) from a transcript, read from the end.
+
+    last_request_epoch: timestamp of the newest MAIN-thread assistant row that
+    carries usage (isSidechain / agentId rows and <synthetic> rows skipped).
+    cache_lifetime: the newest non-unknown _keepwarm_ttl_kind on main-thread rows,
+    so read-only turns after a 1h write still report "1h". Scans at most 16 MB
+    backwards. Returns (None, None) when the file is missing or unreadable.
+    """
+    last_ts = None
+    lifetime = None
+
+    def _take(raw):
+        nonlocal last_ts, lifetime
+        raw = raw.strip()
+        if not raw or b'"assistant"' not in raw:
+            return
+        try:
+            rec = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            return
+        if rec.get("isSidechain") is True or rec.get("agentId"):
+            return
+        msg = rec.get("message")
+        if not isinstance(msg, dict) or msg.get("model") == "<synthetic>":
+            return
+        usage = msg.get("usage")
+        if not isinstance(usage, dict) or not usage:
+            return
+        if last_ts is None:
+            last_ts = _keepwarm_iso_to_epoch(rec.get("timestamp"))
+        if lifetime is None:
+            try:
+                kind = _keepwarm_ttl_kind(usage)
+            except (TypeError, ValueError, OverflowError):
+                kind = "unknown"  # one malformed row; the older rows still count
+            if kind != "unknown":
+                lifetime = kind
+
+    try:
+        with open(path, "rb") as fh:
+            pos = fh.seek(0, os.SEEK_END)
+            carry = b""
+            scanned = 0
+            while pos > 0 and scanned < _STATUS_BAR_TAIL_MAX_BYTES:
+                step = min(_STATUS_BAR_TAIL_CHUNK, pos)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + carry
+                scanned += step
+                parts = buf.split(b"\n")
+                carry = parts[0]
+                for raw in reversed(parts[1:]):
+                    _take(raw)
+                    if last_ts is not None and lifetime is not None:
+                        return last_ts, lifetime
+            if pos == 0 and carry:
+                _take(carry)
+    except (OSError, TypeError, ValueError):
+        return None, None
+    return last_ts, lifetime
+
+
+def _status_bar_quality_cache_dirs():
+    dirs = [QUALITY_CACHE_DIR, RUNTIME_DIR / "token-optimizer"]
+    env_pd = os.environ.get("CLAUDE_PLUGIN_DATA", "").strip()
+    if env_pd:
+        dirs.append(Path(env_pd) / "token-optimizer")
+    try:
+        for d in (RUNTIME_DIR / "plugins" / "data").iterdir():
+            if "token-optimizer" in d.name:
+                dirs.append(d / "token-optimizer")
+    except OSError:
+        pass
+    seen, out = set(), []
+    for d in dirs:
+        key = str(d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def _status_bar_freshest(name):
+    """The newest file called `name` across Token Optimizer's storage dirs, or None."""
+    best, best_mtime = None, -1.0
+    for d in _status_bar_quality_cache_dirs():
+        f = d / name
+        try:
+            mt = f.stat().st_mtime
+        except OSError:
+            continue
+        if mt > best_mtime:
+            best, best_mtime = f, mt
+    return best
+
+
+def _status_bar_checkpoint_epoch(session_id):
+    """When this session last saved a checkpoint, epoch seconds, or None.
+
+    The newer of the quality cache's last_checkpoint_epoch (quality-triggered
+    saves only) and this session's newest checkpoint file, so stop and
+    compaction checkpoints count too.
+    """
+    newest_file = None
+    for d in _status_bar_quality_cache_dirs():
+        try:
+            for f in (d / "checkpoints").glob(f"{session_id}-*.md"):
+                mt = int(f.stat().st_mtime)
+                if newest_file is None or mt > newest_file:
+                    newest_file = mt
+        except OSError:
+            continue
+    cached = _status_bar_cached_checkpoint_epoch(session_id)
+    found = [v for v in (cached, newest_file) if v is not None]
+    return max(found) if found else None
+
+
+def _status_bar_cached_checkpoint_epoch(session_id):
+    """last_checkpoint_epoch from the freshest quality-cache-<sid>.json, or None.
+
+    None when the checkpoint it names is no longer on disk (retention removed
+    it), so the band never reports a save that cannot be restored.
+    """
+    best = _status_bar_freshest(f"quality-cache-{session_id}.json")
+    if best is None:
+        return None
+    try:
+        cache = json.loads(best.read_text(encoding="utf-8"))
+        val = cache.get("last_checkpoint_epoch")
+        saved = cache.get("last_checkpoint_path")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    if not isinstance(saved, str) or not saved:
+        return None
+    try:
+        if not Path(saved).is_file():
+            return None
+    except (OSError, ValueError):
+        return None
+    return val
+
+
+def _status_bar_earlier_checkpoint(session_id):
+    """The earlier session's checkpoint flagged for this one at start, or None.
+
+    Reads the resumable flag the SessionStart pointer writes (freshest across
+    the quality-cache dirs), so the band names the same checkpoint the
+    terminal status line marks as resumable.
+    """
+    best = _status_bar_freshest(f"resumable-{session_id}.json")
+    if best is None:
+        return None
+    try:
+        flag = json.loads(best.read_text(encoding="utf-8"))
+        # Only a checkpoint on this work: an unrelated recent one is noise here.
+        if flag.get("relevant") is not True:
+            return None
+        cp = Path(str(flag.get("checkpoint") or ""))
+        # Only a file in one of Token Optimizer's own checkpoint folders is read.
+        homes = {str((d / "checkpoints").resolve()) for d in _status_bar_quality_cache_dirs()}
+        if cp.suffix != ".md" or str(cp.resolve().parent) not in homes:
+            return None
+        epoch = int(cp.stat().st_mtime)
+    except (OSError, ValueError, AttributeError, TypeError, RuntimeError):
+        return None
+    if not cp.name or cp.name.startswith(session_id):
+        return None
+    try:
+        about = _checkpoint_descriptor(cp) or None
+    except Exception:
+        about = None
+    return {"epoch": epoch, "about": about}
+
+
+def status_bar_payload(session_id, transcript=None, sync=False):
+    """Build the status-bar JSON object (see STATUS_BAR_HELP). Never raises."""
+    sid = sanitize_session_id(session_id)
+    out = {
+        "schema": _STATUS_BAR_SCHEMA,
+        "session_id": sid,
+        "savings": None,
+        "savings_state": "unavailable",
+        "savings_age_s": None,
+        "savings_reason": None,
+        "refresh_started": False,
+        "last_request_epoch": None,
+        "cache_lifetime": None,
+        "last_checkpoint_epoch": None,
+        "earlier_checkpoint": None,
+        "compactions": None,
+    }
+    if sid == "unknown":
+        out["savings_reason"] = "no session id"
+        return out
+
+    try:
+        path = Path(transcript) if transcript else _find_session_jsonl_by_id(sid)
+        if path is not None:
+            out["last_request_epoch"], out["cache_lifetime"] = _status_bar_transcript_state(path)
+            out["compactions"] = _status_bar_compactions(path, sid)
+    except Exception:
+        pass
+    try:
+        out["last_checkpoint_epoch"] = _status_bar_checkpoint_epoch(sid)
+    except Exception:
+        pass
+    try:
+        out["earlier_checkpoint"] = _status_bar_earlier_checkpoint(sid)
+    except Exception:
+        pass
+
+    try:
+        if sync:
+            savings, reason = _status_bar_savings_or_reason(sid)
+            try:
+                _status_bar_write_cache(sid, savings, reason)
+            except OSError:
+                pass
+            out["savings"], out["savings_reason"] = savings, reason
+            out["savings_age_s"] = 0.0
+            out["savings_state"] = "fresh" if savings is not None else "unavailable"
+            return out
+        if not Path(TRENDS_DB).exists():
+            out["savings_reason"] = "no savings recorded yet"
+            return out
+        cached = _status_bar_read_cache(sid)
+        if cached is None:
+            out["savings_state"] = "loading"
+            out["savings_reason"] = "computing savings"
+            out["refresh_started"] = _status_bar_start_refresh(sid)
+            return out
+        age = max(0.0, time.time() - float(cached["computed_at"]))
+        out["savings"] = cached.get("savings")
+        out["savings_reason"] = cached.get("reason") if out["savings"] is None else None
+        out["savings_age_s"] = round(age, 1)
+        stale = age > _STATUS_BAR_CACHE_MAX_AGE_S
+        if out["savings"] is None:
+            out["savings_state"] = "unavailable"
+        else:
+            out["savings_state"] = "stale" if stale else "fresh"
+        if stale:
+            out["refresh_started"] = _status_bar_start_refresh(sid)
+    except Exception:
+        out["savings"] = None
+        out["savings_state"] = "unavailable"
+        out["savings_reason"] = "savings unavailable"
+    return out
+
+
+def _status_bar_cli(args):
+    """`status-bar` subcommand. Prints one JSON object; exit 0 (2 on bad usage)."""
+    if "--help" in args or "-h" in args:
+        print(STATUS_BAR_HELP)
+        sys.exit(0)
+
+    def _opt(name):
+        if name in args:
+            i = args.index(name)
+            # A following flag is not a value: `--session --json` has no session.
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                return args[i + 1]
+        return None
+
+    session = _opt("--session")
+    if not session:
+        print(STATUS_BAR_HELP, file=sys.stderr)
+        sys.exit(2)
+    sync = "--sync" in args
+    child = sync and "--release-lock" in args
+    sid = sanitize_session_id(session)
+    token = os.environ.get(_STATUS_BAR_LOCK_TOKEN_ENV, "") if child else None
+    if sync and not child:
+        # A direct --sync takes the same lock as the background refresh; when one is
+        # already running, this answers from the cache instead of computing twice.
+        token = _status_bar_acquire_lock(sid) if sid != "unknown" else None
+        if token is None:
+            sync = False
+    # The background child gets a hard wall-clock budget: a hung read never lingers.
+    def _out_of_time():
+        # Killed by its budget: leave a reason for the band and free the lock.
+        try:
+            _status_bar_write_cache(sid, None, "savings took too long to compute")
+        except OSError:
+            pass
+        _status_bar_release_lock(sid, token)
+        _log_spawn_failure("status-bar refresh child ran out of time")
+
+    budget = _install_hook_budget(_STATUS_BAR_CHILD_BUDGET_S, on_timeout=_out_of_time) if child else None
+    try:
+        payload = status_bar_payload(session, transcript=_opt("--transcript"), sync=sync)
+    except Exception:
+        payload = {"schema": _STATUS_BAR_SCHEMA, "session_id": sid, "savings": None,
+                   "savings_state": "unavailable", "savings_reason": "savings unavailable"}
+    finally:
+        if token:
+            _status_bar_release_lock(sid, token)
+        if budget is not None:
+            try:
+                budget.cancel()
+            except Exception:
+                pass
+    # Always one JSON object, exit 0: JSON has no Infinity or NaN, so those read as null.
+    print(json.dumps(_status_bar_finite(payload), allow_nan=False))
+    sys.exit(0)
+
+
+def _status_bar_finite(v):
+    """The payload with every non-finite float (inf, nan) replaced by None."""
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {k: _status_bar_finite(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_status_bar_finite(x) for x in v]
+    return v
 
 
 def _install_date():
@@ -48869,6 +49986,9 @@ if __name__ == "__main__":
         compare_snapshots()
     elif args[0] == "dashboard":
         _dispatch_dashboard(args)
+    elif args[0] == "status-bar":
+        # Desktop status band: one JSON read. See STATUS_BAR_HELP.
+        _status_bar_cli(args[1:])
     elif args[0] == "runway-json":
         # Machine-readable runway snapshot so a non-Python dashboard (the OpenClaw
         # / OpenCode TypeScript surfaces) can render the "Your plan goes further"
@@ -49462,7 +50582,9 @@ if __name__ == "__main__":
         # feel like anything but a freeze). Cap it and fail open: a skipped checkpoint on
         # a single Stop is invisible (progressive checkpoints already cover the session),
         # a frozen hook is not. Mirrors the keepwarm-arm budget in the block below.
-        _tok_hook_old_sig = _install_hook_budget(8)
+        # Hooks keep the 8s default. A caller that waits on the result (the desktop
+        # Start fresh button) passes --budget-seconds N, capped at 60.
+        _tok_hook_old_sig = _install_hook_budget(_compact_capture_budget_seconds(args))
         try:
             # Read hook input from stdin (JSON with session_id, transcript_path, etc.)
             hook_input = _read_stdin_hook_input()
@@ -50142,7 +51264,7 @@ if __name__ == "__main__":
             _qc_score_box = {}
 
             def _qc_run():
-                _qc_score_box["score"] = quality_cache(throttle_seconds=throttle, warn_threshold=warn_threshold, quiet=quiet, session_jsonl=session_jsonl, force=force, pure_time_throttle=throttle_only, session_id=session_id_from_hook, warn=warn)
+                _qc_score_box["score"] = quality_cache(throttle_seconds=throttle, warn_threshold=warn_threshold, quiet=quiet, session_jsonl=session_jsonl, force=force, pure_time_throttle=throttle_only, session_id=session_id_from_hook, warn=warn, post_compact=isinstance(payload, dict) and payload.get("hook_event_name") == "PostCompact")
 
             # SessionStart is the one wiring where Codex parses this hook's stdout
             # against the strict session-start schema, so collapse whatever was
@@ -51018,6 +52140,7 @@ if __name__ == "__main__":
         print("  python3 measure.py setup-hook --dry-run # Show what would be installed")
         print("  python3 measure.py setup-hook --uninstall  # Remove Token Optimizer's SessionEnd hook")
         print("  python3 measure.py compact-capture          # Capture session state checkpoint")
+        print("  python3 measure.py compact-capture --budget-seconds N  # Allow up to N s (default 8, max 60)")
         print("  python3 measure.py checkpoint-trigger --milestone pre-fanout  # Milestone checkpoint with guards")
         print("  python3 measure.py compact-restore          # Restore context from checkpoint")
         print("  python3 measure.py continue-last --topic TEXT  # Show Codex continuity hint for a topic")
@@ -51036,6 +52159,7 @@ if __name__ == "__main__":
         print("  python3 measure.py setup-smart-compact --status     # Check which hooks are installed")
         print("  python3 measure.py setup-smart-compact --uninstall  # Remove Smart Compaction hooks")
         print("  python3 measure.py quality-cache                    # Update quality cache (for status line)")
+        print("  python3 measure.py status-bar --session ID --json   # Desktop status band data (status-bar --help)")
         print("  python3 measure.py quality-cache --warn             # Update cache + warn Claude if low")
         print("  python3 measure.py quality-cache --quiet            # Silent mode (for hooks)")
         print("  python3 measure.py setup-quality-bar                # Install quality bar (status line + hook)")

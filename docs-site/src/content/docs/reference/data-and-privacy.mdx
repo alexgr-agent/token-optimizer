@@ -35,7 +35,7 @@ On macOS and Linux, every store is created with restrictive permissions: directo
 |---|---|---|---|
 | Session metrics database | Per-session aggregates: token counts, model usage, cost estimates, session UUIDs, JSONL paths | `<plugin-data>/data/trends.db` | `TOKEN_OPTIMIZER_TRENDS_RETENTION_DAYS` (default unlimited) |
 | Per-session file cache | File-read records, content hashes, token estimates, cached content up to 50KB per file (credential-redacted) | `<plugin-data>/data/session-store/<id>.db` | Auto-deleted after 48 hours |
-| Checkpoints | Truncated conversation context, extracted decisions, error snippets, todos | `~/.claude/token-optimizer/checkpoints/` | `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_DAYS` (default 7), max `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` (default 50) |
+| Checkpoints | Truncated conversation context, extracted decisions, error snippets, todos | `~/.claude/token-optimizer/checkpoints/` | `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_DAYS` (default 7), newest `TOKEN_OPTIMIZER_CHECKPOINT_PER_SESSION` per session (default 5), at most `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` in total (default 400) |
 | Tool archives | Full output of large tool calls (over 4KB), credential-redacted | `<plugin-data>/data/tool-archive/<id>/` | `TOKEN_OPTIMIZER_ARCHIVE_RETENTION_HOURS` (default 24) |
 | Quality cache | Per-session quality-score snapshots | `~/.claude/token-optimizer/quality-cache-*.json` | `TOKEN_OPTIMIZER_QUALITY_CACHE_RETENTION_DAYS` (default 7) |
 | Config | Feature flags, consent status, pricing tier, timestamps | `~/.claude/token-optimizer/config.json` | Persistent until purge |

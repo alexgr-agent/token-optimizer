@@ -96,7 +96,7 @@ Checkpoint capture and restore, plus the cold-resume path for reopening a forgot
 
 | Command | Description | Key flags |
 |---|---|---|
-| `compact-capture` | Save a checkpoint of session state (decisions, errors, agent state, open TODOs) | `--trigger auto\|stop\|stop-failure`, `--quiet` |
+| `compact-capture` | Save a checkpoint of session state (decisions, errors, agent state, open TODOs) | `--trigger auto\|stop\|stop-failure`, `--quiet`, `--budget-seconds N` (time limit, default 8, max 60) |
 | `compact-restore` | Inject the most recent checkpoint as context on a new session | `--compact`, `--new-session-only` |
 | `checkpoint-trigger` | Save a milestone checkpoint (for example before sub-agent dispatch) | `--milestone NAME`, `--quiet` |
 | `list-checkpoints` | List saved checkpoints with age and filename, newest first | n/a |
@@ -142,6 +142,7 @@ Both `jsonl-trim` and `jsonl-dedup` run in dry-run mode unless `--apply` is pass
 |---|---|---|
 | `quality` | Compute the 0-100 quality score for a session from 7 signals, with a quality-over-time chart | `[SESSION_ID\|current]`, `--json` |
 | `quality-cache` | Compute and cache the current session quality score (throttled). Runs automatically via hooks. | `--warn`, `--quiet`, `--throttle N`, `--force`, `--throttle-only` |
+| `status-bar` | One JSON answer for the desktop status bar: the 30-day saved total the dashboard shows, this session's savings, the cache anchor and lifetime, the last checkpoint, compactions. Answers from a cache and refreshes it in the background. | `--session ID`, `--json`, `--transcript PATH` |
 | `attention-score` | Score a markdown file against the LLM attention curve | `[FILE]`, `--json` |
 | `attention-optimize` | Propose or apply section reordering to move critical content into high-attention zones; backs up first | `[FILE]`, `--apply`, `--dry-run` |
 

@@ -214,6 +214,7 @@ def test_rebuild_emit_committed_reproduces_committed_tree(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_marketplace_lists_exactly_three_plugins():
+    # The desktop status bar ships inside token-optimizer, not as its own entry.
     plugins = _load(MARKETPLACE)["plugins"]
     by_name = {p["name"]: p for p in plugins}
     assert len(plugins) == 3, f"expected 3 plugins, got {[p['name'] for p in plugins]}"

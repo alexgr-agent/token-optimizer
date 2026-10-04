@@ -66,7 +66,14 @@ posix_only = pytest.mark.skipif(
 )
 
 # All hooks.json shipped in the repo (each maps to one or more harnesses).
-HOOKS_JSONS = _rglob_excluding(REPO, "hooks.json")
+# A Claude Code mod plugin's hooks.json lists TypeScript modules, not shell
+# commands, so the launcher contract below does not apply to it.
+def _is_mod_only(path: Path) -> bool:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return "modules" in data and not data.get("hooks")
+
+
+HOOKS_JSONS = [p for p in _rglob_excluding(REPO, "hooks.json") if not _is_mod_only(p)]
 
 
 def _run_chain(target_script: Path, env_extra=None, args=("--quiet",)):

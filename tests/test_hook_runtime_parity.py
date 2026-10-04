@@ -179,6 +179,10 @@ def test_unassessable_lease_metadata_fails_open_without_reclamation(
     record = record_factory()
     path = tmp_path / "state.lease"
     path.write_text(record)
+    # Keep the file "just written" however slow the runner is: a malformed
+    # lease older than its grace is reclaimable by design.
+    fresh = time.time() + 5
+    os.utime(path, (fresh, fresh))
     acquired = LeaseLock(path, acquire_timeout=0, reclaim_grace=0).acquire()
     assert not acquired and path.exists() and path.read_text() == record
 

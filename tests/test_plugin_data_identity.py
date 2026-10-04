@@ -484,8 +484,10 @@ def test_hook_and_cli_resolve_same_root(monkeypatch, tmp_path):
 def _now_iso():
     # The guard only denies inside its loop window, so fixtures need a fresh
     # timestamp like the ones archive_result always writes.
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
+    # A second back: on Windows, datetime.now() can run a few ms ahead of the
+    # guard's time.time(), and a future-dated entry reads as outside the window.
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
 
 
 def test_refetch_guard_renderable_check(monkeypatch, tmp_path):

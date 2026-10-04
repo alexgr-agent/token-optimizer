@@ -238,9 +238,10 @@ def test_codex_mirror_hooks_json_is_async_stipped_root():
             return [_deresolve(v) for v in o]
         return o
 
-    expected = _clamp_session_end(
-        _strip_async(json.loads(root_hj.read_text(encoding="utf-8")))
-    )
+    # Fourth: the desktop status bar's hooks module is dropped (Codex loads none).
+    root_doc = json.loads(root_hj.read_text(encoding="utf-8"))
+    root_doc.pop("modules", None)
+    expected = _clamp_session_end(_strip_async(root_doc))
     actual = _deresolve(json.loads(mirror_hj.read_text(encoding="utf-8")))
     assert actual == expected, (
         "plugins/token-optimizer/hooks/hooks.json drifted from the root "

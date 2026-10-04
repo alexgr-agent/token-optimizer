@@ -100,6 +100,9 @@ def strip_async(o):
         for v in o:
             strip_async(v)
 strip_async(data)
+# The desktop status bar is a Claude Code hooks module; the mirror ships no
+# desktop/ folder and Codex has no hooks modules.
+data.pop("modules", None)
 # Clamp SessionEnd timeouts only (the event Codex caps at 3s). Other events keep
 # their declared timeouts; Codex does not warn on those.
 for group in data.get("hooks", {}).get("SessionEnd", []):

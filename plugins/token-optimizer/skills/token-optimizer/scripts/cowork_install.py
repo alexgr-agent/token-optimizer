@@ -242,8 +242,12 @@ def _add_hooks_pointer(manifest_path: Path) -> None:
     """Point the manifest at hooks/hooks.json explicitly. In some Cowork builds,
     plugin hooks only load when the manifest declares
     them; Claude Code defaults to the same path, so the field is harmless
-    everywhere else."""
+    everywhere else.
+
+    Also drops ``types``: it describes the desktop status bar's state, and the
+    Cowork plugin carries neither the bar nor the file it points at."""
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("types", None)
     manifest["hooks"] = "./hooks/hooks.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 

@@ -1,5 +1,42 @@
 # Changelog
 
+## [5.13.33] - 2026-10-04
+
+- The "start a fresh session" tip shows once per session, as intended, instead of returning on later prompts.
+- Clean up in the desktop status bar says when Claude Code skips the compaction, instead of reporting "Cleaned up."
+
+## [5.13.32] - 2026-10-04
+
+- Every session now keeps its own checkpoints, so running several sessions at once no longer clears out the quiet ones. Applies on every platform that saves checkpoints through Token Optimizer's engine.
+- The desktop status bar only shows a checkpoint that is still there to restore.
+- Passes the stricter plugin check in Claude Code 2.1.289.
+
+## [5.13.31] - 2026-10-04
+
+- The desktop status bar comes alive again: Clawd follows what your session is doing, and the arrow, Clean up, Start fresh and Keep warm respond to a click.
+
+## [5.13.30] - 2026-10-03
+
+- The desktop status bar now comes with Token Optimizer itself: install or update the plugin and it appears above your prompt, nothing extra to add.
+- Hide it any time with `TOKEN_OPTIMIZER_STATUS_BAR=0` in your settings `env`.
+- Older Claude Code versions keep every Token Optimizer feature and simply skip the bar.
+
+## [5.13.29] - 2026-10-03
+
+- New: a Token Optimizer status bar for the Claude desktop app, as the separate `token-optimizer-desktop` plugin: `/plugin install token-optimizer-desktop@alexgreensh-token-optimizer`.
+- Quality, context, cache countdown and both usage limits at a glance, with a one-click Clean up, Start fresh or Keep warm when you need one.
+- One more line shows your session, its last checkpoint, and the tokens Token Optimizer saved you in the last 30 days.
+- Clawd acts out what your session is doing. Needs Claude Code 2.1.287 or newer; the terminal status line is unchanged.
+- The status line now counts compactions the moment they happen.
+
+## [5.13.28] - 2026-09-30
+
+- Up-to-date model prices: gpt-6.1-sol.
+
+## [5.13.27] - 2026-09-29
+
+- Up-to-date model prices: sonnet_5_5.
+
 ## [5.13.26] - 2026-09-27
 
 - Keep detached dashboard self-heals single-flight for the entire rebuild, even on large histories, and record the rebuild child's PID.

@@ -125,6 +125,16 @@ Two disclosures specific to this adapter:
   `conversation_summaries.db` and are treated as untrusted, filtered to
   printable characters, and capped at 200 characters per field (R22).
 
+## Desktop status bar
+
+The plugin's `hooks/hooks.json` also names one hooks module under `modules`: `desktop/token-optimizer-desktop/hooks/register.tsx`. It is not a hook runner: it uses Claude Code's mods feature (2.1.287+) to draw a status bar above the prompt in the Claude desktop app. It adds no entries to the hook inventory above and changes nothing for terminal or VS Code sessions. Older Claude Code versions skip the module and run every hook above as before. The Codex and Cowork builds leave it out.
+
+- **Install**: comes with the main plugin; nothing extra to install.
+- **Reads**: Token Optimizer's local data (its quality cache, the installed-plugins list, and `measure.py status-bar`), the session itself, and the current git branch. No network access of its own.
+- **Writes**: no files of its own. `status-bar` keeps a small per-session cache under Token Optimizer's data folder, refreshed in the background, and the plugin keeps its own state in Claude Code (its stored values and a pending Start fresh hand-off). Its three buttons act only on a click: Clean up compacts using Token Optimizer's guidance, Start fresh saves a checkpoint and clears after a second click, and Keep warm sends a manual one-click cache refresh that uses a small amount of usage.
+- **Switch**: Anthropic can turn mods off remotely. When off, the bar does not appear and nothing else changes.
+- **Settings**: `TOKEN_OPTIMIZER_STATUS_BAR=0` hides the bar and `TOKEN_OPTIMIZER_STATUS_BAR_ANIMATE=0` keeps Clawd still, set in the `env` block of `~/.claude/settings.json` like the other Token Optimizer switches.
+
 ## Generating a Security Report
 
 ```

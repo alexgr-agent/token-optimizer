@@ -344,6 +344,16 @@ def test_dashboard_read_does_not_wait_behind_a_held_write_lock(tmp_path, monkeyp
     conn.commit()
     conn.close()
 
+    # The same read with no lock held: how long this runner takes for the work itself.
+    # (It also does the upkeep, so the timed read below has it to do again.)
+    t0 = time.monotonic()
+    _daily(measure)
+    baseline = time.monotonic() - t0
+    conn = measure._init_trends_db()
+    conn.execute("UPDATE session_log SET daily_usage_json = NULL")
+    conn.commit()
+    conn.close()
+
     writer = sqlite3.connect(str(measure.TRENDS_DB))
     writer.execute("BEGIN IMMEDIATE")
     try:
@@ -354,7 +364,9 @@ def test_dashboard_read_does_not_wait_behind_a_held_write_lock(tmp_path, monkeyp
         writer.rollback()
         writer.close()
 
-    assert elapsed < 2.5
+    # Giving up after the 0.2 s upkeep timeout fits easily; waiting out the 5 s
+    # busy timeout does not, however slow the runner.
+    assert elapsed < baseline + 2.5
     assert day["total_cost_usd"] == pytest.approx(_cost(measure, "claude-opus-4-8"), abs=1e-4)
 
 

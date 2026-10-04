@@ -251,6 +251,7 @@ class LeaseLock:
         lease_seconds: float = 10.0,
         reclaim_grace: float = 0.25,
         cohort_throttle: bool = True,
+        reclaim_released: bool = False,
     ):
         # Preserve an already-materialized concrete path. This also lets tests
         # simulate Windows by changing os.name after pathlib created PosixPath
@@ -261,6 +262,10 @@ class LeaseLock:
         self.lease_seconds = max(0.1, float(lease_seconds))
         self.reclaim_grace = max(0.0, float(reclaim_grace))
         self.cohort_throttle = bool(cohort_throttle)
+        # A contender with a mutation of its own (not one more member of the
+        # herd the reservation exists to absorb) may take a RELEASED lease at
+        # once; a lease still held is never taken early.
+        self.reclaim_released = bool(reclaim_released)
         self.nonce = secrets.token_hex(16)
         self._owner_path = self.path.with_name(
             f".{self.path.name}.candidate-{self.nonce}"
@@ -444,7 +449,7 @@ class LeaseLock:
             return False
         if owner.get("released"):
             reuse = float(owner.get("reuse_wall", created))
-            if owner.get("pid") != os.getpid() and now <= reuse:
+            if owner.get("pid") != os.getpid() and now <= reuse and not self.reclaim_released:
                 return False
         elif now <= expires + self.reclaim_grace:
             return False

@@ -1,0 +1,59 @@
+---
+title: Claude desktop app
+description: "The Token Optimizer status bar above the prompt in the Claude desktop app, included with the Token Optimizer plugin."
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The Token Optimizer plugin adds a status bar above the prompt in the Claude desktop app. It shows session quality, context, cache and limits at a glance, and puts Clean up, Start fresh and Keep warm one click away.
+
+## Prerequisites
+
+- The Token Optimizer plugin (see [Claude Code (CLI)](/install/claude-code-cli/)). The status bar is part of it.
+- Claude Code 2.1.287 or newer.
+- Anthropic's mods feature. Anthropic can switch it off remotely. When it is off, nothing breaks and the bar simply does not appear.
+
+## Install
+
+Nothing extra. Install or update the Token Optimizer plugin and open a new session in the desktop app; the bar appears above the prompt.
+
+<Aside>
+If you installed the separate `token-optimizer-desktop` plugin from an earlier release, remove it so only one bar shows: `/plugin uninstall token-optimizer-desktop@alexgreensh-token-optimizer`.
+</Aside>
+
+## What it shows
+
+- One sentence about the most urgent thing, with at most one button.
+- Five marks: quality grade, context fill, cache countdown, 5-hour limit, weekly limit. Hover any mark for a card.
+- The **arrow beside Clawd** unfolds one more line: branch, session time, tool calls, compactions (when any), when the last checkpoint was saved (any kind, or a relevant one from an earlier session), and the tokens Token Optimizer saved you in the last 30 days, the same total the dashboard shows.
+- Clawd acts out what the session is doing: thinking, reading, typing, subagents, waiting for your permission, writing, compacting, done, stopped, API error, cold cache, napping.
+
+## Buttons
+
+- **Clean up** compacts with Token Optimizer's guidance, the same as typing `/compact`.
+- **Start fresh** asks for a second click, then saves a checkpoint, clears, and hands the checkpoint to your first message.
+- **Keep warm** is a manual, one-click cache refresh. It is offered only while the cache is still warm and its lifetime has been measured. It never runs on its own, disappears when the cache expires, and uses a small amount of your usage. Afterwards it tells you how many tokens it re-read from the cache and that the countdown is back to full. It is separate from the [Keep-Warm daemon](/features/keep-warm/#the-manual-keep-warm-button).
+
+## The cache countdown
+
+The countdown is an estimate, because Claude does not publish the exact expiry. It assumes 1 hour on Claude plans and 5 minutes on the API, and is measured from the session itself when possible.
+
+## Settings
+
+Two switches, set in the `env` block of `~/.claude/settings.json` like the other Token Optimizer switches:
+
+- `"TOKEN_OPTIMIZER_STATUS_BAR": "0"` hides the bar.
+- `"TOKEN_OPTIMIZER_STATUS_BAR_ANIMATE": "0"` keeps Clawd still.
+
+## Where it works
+
+The Claude desktop app only. The terminal keeps its existing [status line](/features/status-line/). VS Code is not supported.
+
+## Turning it off
+
+Add `"TOKEN_OPTIMIZER_STATUS_BAR": "0"` to the `env` block of `~/.claude/settings.json` and start a new session. The rest of Token Optimizer keeps working.
+
+## See also
+
+- [The quality status line](/features/status-line/) for the terminal version.
+- [Keep-Warm](/features/keep-warm/) for the automatic, API-billed daemon.

@@ -45,3 +45,7 @@ decisions.md
 handoff/
 scratchpad/
 .working-scratch/
+
+# token-optimizer-desktop mod: engine-generated API declarations (written at every load)
+desktop/token-optimizer-desktop/.claude-plugin/types/
+desktop/token-optimizer-desktop/node_modules/

@@ -229,8 +229,10 @@ def test_old_store_without_the_column_migrates(dedup, tmp_path):
     assert "last_tool_use_id" in cols
 
 
-def test_pre_fix_twin_without_tool_use_id_is_recognised(dedup):
+def test_pre_fix_twin_without_tool_use_id_is_recognised(dedup, monkeypatch):
     # The stuck Cowork copy runs old code: its row has no last_tool_use_id.
+    # A wide window keeps a slow runner's gap between write and check inside it.
+    monkeypatch.setattr(dedup, "_LEGACY_TWIN_SECONDS", 60.0)
     from session_store import SessionStore
     from delta_diff import content_hash
     store = SessionStore("twin-session")

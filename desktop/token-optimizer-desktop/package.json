@@ -1,0 +1,16 @@
+{
+  "name": "token-optimizer-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pure-module type-check and tests for the Token Optimizer desktop status bar mod",
+  "type": "module",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.pure.json",
+    "test": "node --experimental-strip-types --test tests/pure/*.spec.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3"
+  }
+}

@@ -57,7 +57,8 @@ The read cache operates in one of four modes, selected with `TOKEN_OPTIMIZER_REA
 | Variable | Default | Effect |
 |---|---|---|
 | `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_DAYS` | 7 | Days to keep checkpoints before cleanup |
-| `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` | 50 | Maximum checkpoints to scan for restore |
+| `TOKEN_OPTIMIZER_CHECKPOINT_PER_SESSION` | 5 | Newest checkpoints each session keeps, plus its newest of each trigger, so a busy session never removes another session's checkpoints |
+| `TOKEN_OPTIMIZER_CHECKPOINT_RETENTION_MAX` | 400 | Disk ceiling across all sessions; under it, each session's newest checkpoint goes last. OpenCode reads it as the number of past sessions to scan for restore (default 50 there) |
 | `TOKEN_OPTIMIZER_CHECKPOINT_TELEMETRY` | off | Set to `1` to enable the `checkpoint-stats` telemetry summary |
 | `TOKEN_OPTIMIZER_PROGRESSIVE_CHECKPOINTS` | enabled | Set to `0`, `false`, `no`, or `off` to disable progressive checkpoint capture at the 20/35/50/65/80% fill bands |
 | `TOKEN_OPTIMIZER_CHECKPOINT_FILES` | 10 | Maximum active/recent files retained in extracted checkpoint state |

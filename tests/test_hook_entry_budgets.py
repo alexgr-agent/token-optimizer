@@ -467,3 +467,89 @@ def test_budget_code_is_identical_in_every_mirror(canonical, mirrors):
         if not path.exists():
             pytest.skip(f"{mirror} not present in this tree")
         assert path.read_bytes() == want, f"{mirror} drifted from {canonical}"
+
+
+# --------------------------------------------------------------------------
+# 6. compact-capture --budget-seconds (desktop Start fresh waits on it)
+# --------------------------------------------------------------------------
+
+_DEADLINE_RECORDER = """
+import runpy, sys
+sys.path.insert(0, {scripts!r})
+import hook_runtime
+
+_Real = hook_runtime.HookDeadline
+
+
+class _Recording(_Real):
+    def __init__(self, seconds, *a, **kw):
+        with open({out!r}, "a", encoding="utf-8") as fh:
+            fh.write(repr(float(seconds)) + "\\n")
+        super().__init__(seconds, *a, **kw)
+
+
+hook_runtime.HookDeadline = _Recording
+sys.argv = [{measure!r}] + sys.argv[1:]
+runpy.run_path({measure!r}, run_name="__main__")
+"""
+
+
+def _capture_budgets(tmp_path, extra_args):
+    """Run the real `measure.py compact-capture` dispatch and return every
+    HookDeadline budget it armed, in order."""
+    out = tmp_path / "budgets.txt"
+    launcher = tmp_path / "launch.py"
+    launcher.write_text(_DEADLINE_RECORDER.format(
+        scripts=str(SCRIPTS), out=str(out), measure=str(SCRIPTS / "measure.py")),
+        encoding="utf-8")
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    env = os.environ.copy()
+    env.pop("TOKEN_OPTIMIZER_HOOK_BUDGET_MS", None)
+    env.update({
+        "PYTHONUTF8": "1",
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+        "TOKEN_OPTIMIZER_SNAPSHOT_DIR": str(tmp_path / "snap"),
+    })
+    proc = subprocess.run(
+        [sys.executable, str(launcher), "compact-capture", "--trigger", "start-fresh",
+         "--quiet", *extra_args],
+        capture_output=True, text=True, timeout=60, env=env, input="{}")
+    assert proc.returncode == 0, proc.stderr
+    assert "Traceback" not in proc.stderr, proc.stderr
+    return [float(x) for x in out.read_text(encoding="utf-8").split()] if out.exists() else []
+
+
+def test_compact_capture_default_budget_is_unchanged(tmp_path):
+    assert _capture_budgets(tmp_path, []) == [8.0]
+
+
+def test_compact_capture_budget_seconds_raises_the_cap(tmp_path):
+    assert _capture_budgets(tmp_path, ["--budget-seconds", "30"]) == [30.0]
+
+
+@pytest.mark.parametrize(
+    "args,want",
+    [
+        (["--budget-seconds", "600"], 60.0),   # capped
+        (["--budget-seconds", "0"], 8),        # non-positive -> default
+        (["--budget-seconds", "-5"], 8),
+        (["--budget-seconds", "nan"], 8),
+        (["--budget-seconds", "abc"], 8),
+        (["--budget-seconds"], 8),             # missing value
+        (["--trigger", "stop", "--quiet"], 8), # hooks pass nothing
+    ],
+)
+def test_compact_capture_budget_seconds_is_bounded(args, want):
+    import measure
+    assert measure._compact_capture_budget_seconds(["compact-capture", *args]) == want
+
+
+def test_start_fresh_capture_gets_no_entry_budget():
+    """The hook entry budgets match Stop/PreCompact triggers only, so the
+    desktop's own capture is bounded by --budget-seconds alone."""
+    assert resolve_entry_budget(
+        "measure", ["compact-capture", "--trigger", "start-fresh", "--budget-seconds", "30"]
+    ) == (None, None)
