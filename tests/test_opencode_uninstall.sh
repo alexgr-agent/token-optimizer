@@ -93,5 +93,16 @@ if [ "$remaining" = "['other']" ]; then ok "v2-reverts-package-entries-keeps-oth
 rm -rf "${tmp6}"
 unset OPENCODE_CONFIG_DIR
 
+# --- 7. Older ["name", {options}] pair in the V1 plugin array ----------------
+tmp7="$(mktemp -d)"
+cat > "${tmp7}/opencode.json" <<'JSON'
+{"plugin":[["token-optimizer-opencode",{"dataDir":"/x"}],"other"]}
+JSON
+OPENCODE_CONFIG_DIR="${tmp7}" out="$(uninstall_opencode 2>&1)" || true
+remaining="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("plugin"))' "${tmp7}/opencode.json" 2>/dev/null)"
+if [ "$remaining" = "['other']" ]; then ok "v1-reverts-name-options-pair"; else nok "v1-reverts-name-options-pair" "remaining='$remaining'"; fi
+rm -rf "${tmp7}"
+unset OPENCODE_CONFIG_DIR
+
 printf '\n%d/%d passed\n' "$pass" "$((pass+fail))"
 [ "$fail" -eq 0 ]

@@ -3,6 +3,7 @@ import { SessionStore } from "./storage/session-store.js";
 import { TrendsStore } from "./storage/trends.js";
 import { hashProjectDir } from "./util/env.js";
 import { setupV2 } from "./v2.js";
+import { TokenOptimizerPlugin } from "./index.js";
 import { generateCompactionContext } from "./compaction/dynamic-instructions.js";
 
 function fakeContext() {
@@ -12,11 +13,13 @@ function fakeContext() {
   let wake: (() => void) | undefined;
   const controller = {
     emit(event: any) { events.push(event); wake?.(); },
-    async *iterator() {
-      while (true) {
+    async *iterator(signal?: AbortSignal) {
+      // Like the real subscription, it ends when the signal aborts.
+      signal?.addEventListener("abort", () => wake?.());
+      while (!signal?.aborted) {
         if (!events.length) await new Promise<void>((resolve) => { wake = resolve; });
         wake = undefined;
-        while (events.length) yield events.shift();
+        while (events.length && !signal?.aborted) yield events.shift();
       }
     },
   };
@@ -29,7 +32,7 @@ function fakeContext() {
     },
     shell: { hook: async (name: string, fn: any) => { hooks.set(`shell.${name}`, fn); return { dispose: async () => {} }; } },
     session: { hook: async (name: string, fn: any) => { hooks.set(`session.${name}`, fn); return { dispose: async () => {} }; } },
-    event: { subscribe: () => controller.iterator() },
+    event: { subscribe: (opts?: { signal?: AbortSignal }) => controller.iterator(opts?.signal) },
   };
   return { ctx, hooks, tools, controller };
 }
@@ -114,5 +117,97 @@ describe("OpenCode V2 adapter", () => {
     expect(event.result).toBeUndefined(); // OpenCode's native compaction still runs.
     expect(event.system.length).toBeGreaterThan(0);
     await cleanup?.();
+  });
+  test("a failed tool is recorded as a failure, whatever its message says", async () => {
+    const { ctx, hooks } = fakeContext();
+    const cleanup = await setupV2(ctx);
+    await hooks.get("session.prompt")!({ sessionID: "f1", messageID: "mf", prompt: { text: "Run the slow build and report" } });
+    await hooks.get("tool.execute.after")!({ sessionID: "f1", tool: "bash", input: {}, status: "error", error: { message: "process timed out after 120s" } });
+    const store = new SessionStore(ctx.options.dataDir, "f1", hashProjectDir(ctx.location.project.directory));
+    expect(store.getRecentToolResults(5)[0]?.is_failure).toBe(1);
+    store.close();
+    await cleanup?.();
+  });
+  test("structured tool output counts at its real size", async () => {
+    const { ctx, hooks } = fakeContext();
+    const cleanup = await setupV2(ctx);
+    await hooks.get("session.prompt")!({ sessionID: "o1", messageID: "mo", prompt: { text: "Find the matching lines please" } });
+    const output = { findings: ["a".repeat(500)] };
+    await hooks.get("tool.execute.after")!({ sessionID: "o1", tool: "grep", input: {}, status: "completed", result: { output } });
+    const store = new SessionStore(ctx.options.dataDir, "o1", hashProjectDir(ctx.location.project.directory));
+    expect(store.getRecentToolResults(5)[0]?.result_size).toBe(JSON.stringify(output).length);
+    store.close();
+    await cleanup?.();
+  });
+  test("failed-step usage counts, a compaction reported twice counts once, a replayed event is ignored", async () => {
+    const { ctx, hooks, controller } = fakeContext();
+    const cleanup = await setupV2(ctx);
+    const sid = `dedupe-${crypto.randomUUID()}`;
+    await hooks.get("session.prompt")!({ sessionID: sid, messageID: "md", prompt: { text: "Please assess the source code" } });
+    const tokens = { input: 20, output: 3, cache: { read: 1, write: 0 } };
+    controller.emit({ type: "session.step.failed", id: "fail-1", data: { sessionID: sid, error: {}, tokens: { input: 7, output: 0, cache: { read: 0, write: 0 } }, cost: 0.001 } });
+    controller.emit({ type: "session.usage.recorded", id: "use-1", data: { sessionID: sid, source: "compaction", tokens, cost: 0.002 } });
+    const ended = { type: "session.compaction.ended", id: "cmp-1", data: { sessionID: sid, tokens, cost: 0.002 } };
+    controller.emit(ended);
+    controller.emit(ended); // a durable replay
+    controller.emit({ type: "session.idle", data: { sessionID: sid } });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const trends = new TrendsStore(ctx.options.dataDir);
+    const row = trends.getAllSessions().find((r) => r.session_id === sid);
+    expect(row?.tokens_input).toBe(27);
+    expect(row?.cost_usd).toBe(0.003);
+    expect(row?.compactions).toBe(1);
+    trends.close();
+    await cleanup?.();
+  });
+  test("prompt dedup is per session and never swallows prompts without an id", async () => {
+    const { ctx, hooks } = fakeContext();
+    const cleanup = await setupV2(ctx);
+    await hooks.get("session.prompt")!({ sessionID: "d1", messageID: "same", prompt: { text: "First session prompt here" } });
+    await hooks.get("session.prompt")!({ sessionID: "d2", messageID: "same", prompt: { text: "Second session prompt here" } });
+    await hooks.get("session.prompt")!({ sessionID: "d2", prompt: { text: "No id prompt one" } });
+    await hooks.get("session.prompt")!({ sessionID: "d2", prompt: { text: "No id prompt two" } });
+    const store = new SessionStore(ctx.options.dataDir, "d2", hashProjectDir(ctx.location.project.directory));
+    expect(store.getRecentMessages(10).length).toBe(3);
+    store.close();
+    await cleanup?.();
+  });
+  test("malformed events are ignored instead of throwing into the host", async () => {
+    const { ctx, hooks } = fakeContext();
+    const cleanup = await setupV2(ctx);
+    await hooks.get("shell.create.before")!({});
+    await hooks.get("session.prompt")!({ sessionID: "m1" });
+    await cleanup?.();
+    await cleanup?.(); // idempotent
+  });
+  test("a failed setup removes what it had already registered", async () => {
+    const { ctx } = fakeContext();
+    let disposed = 0;
+    let calls = 0;
+    ctx.session.hook = async (name: string) => {
+      calls += 1;
+      if (calls === 2) throw new Error(`host refused ${name}`);
+      return { dispose: async () => { disposed += 1; } };
+    };
+    ctx.tool.hook = async () => ({ dispose: async () => { disposed += 1; } });
+    ctx.shell.hook = async () => ({ dispose: async () => { disposed += 1; } });
+    ctx.tool.transform = async () => ({ dispose: async () => { disposed += 1; } });
+    await expect(setupV2(ctx)).rejects.toThrow("host refused");
+    expect(disposed).toBe(5); // transform, shell, prompt, tool before, tool after
+  });
+  test("tools keep the V1 descriptions and V1 hooks expose no helper keys", async () => {
+    const { ctx, tools } = fakeContext();
+    const cleanup = await setupV2(ctx);
+    const v1 = await TokenOptimizerPlugin({ directory: process.cwd(), project: { id: "p", worktree: process.cwd() } } as any, ctx.options);
+    expect(tools[0].description).toBe((v1 as any).tool.token_status.description);
+    expect(Object.keys(v1)).not.toContain("dispose");
+    expect(Object.keys(v1)).not.toContain("statusForSession");
+    await (v1 as any).dispose();
+    await cleanup?.();
+  });
+  test("line separators in paths are escaped in compaction guidance", () => {
+    const guidance = generateCompactionContext("code", ["/tmp/a b.txt"], null, null).join("\n");
+    expect(guidance).not.toContain(" ");
+    expect(guidance).toContain("\\u2028");
   });
 });

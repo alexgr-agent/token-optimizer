@@ -70,7 +70,7 @@ jobs:
       - name: Install pinned adapter dependencies
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Typecheck and test both entrypoints
-        run: bun run typecheck && bun test && bun run build
+        run: bun run typecheck && bun test && bun run build && bun run build:bundle
 
   pi-native:
     runs-on: ubuntu-latest

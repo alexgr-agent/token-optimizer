@@ -119,8 +119,9 @@ install_opencode() {
 
     info "Installing OpenCode dependencies (bun install)..."
     # --frozen-lockfile: install exactly what bun.lock pins, no silent drift to a
-    # newer (untested) transitive version at install time.
-    if ! ( cd "$oc_src" && bun install --frozen-lockfile --silent ); then
+    # newer (untested) transitive version at install time. --ignore-scripts: no
+    # dependency's install script runs; the bundle build needs none of them.
+    if ! ( cd "$oc_src" && bun install --frozen-lockfile --ignore-scripts --silent ); then
         fail "bun install failed in ${oc_src} (lockfile out of sync? run 'bun install' in opencode/)."
     fi
 
@@ -224,8 +225,11 @@ for key in ("plugin", "plugins"):
     entries = data.get(key)
     if not isinstance(entries, list):
         continue
+    # A plain name, a {"package": ...} object, or the older ["name", {options}] pair.
     retained = [entry for entry in entries if not (
-        entry == target or (isinstance(entry, dict) and entry.get("package") == target)
+        entry == target
+        or (isinstance(entry, dict) and entry.get("package") == target)
+        or (isinstance(entry, list) and len(entry) > 0 and entry[0] == target)
     )]
     if len(retained) != len(entries):
         changed = True
@@ -253,6 +257,7 @@ except (json.JSONDecodeError, OSError):
 target = "token-optimizer-opencode"
 found = any(isinstance(data.get(key), list) and any(
     entry == target or (isinstance(entry, dict) and entry.get("package") == target)
+    or (isinstance(entry, list) and len(entry) > 0 and entry[0] == target)
     for entry in data[key]) for key in ("plugin", "plugins"))
 print("would-remove" if found else "noop")
 PYCHECK

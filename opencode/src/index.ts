@@ -773,7 +773,12 @@ export const TokenOptimizerPlugin: Plugin = async (
     sessions.clear();
     trendsStore?.close();
   };
-  return Object.assign(hooks, { dispose, statusForSession });
+  // Not hooks: kept off the enumerable keys so nothing iterating the hooks calls them.
+  Object.defineProperties(hooks, {
+    dispose: { value: dispose, enumerable: false },
+    statusForSession: { value: statusForSession, enumerable: false },
+  });
+  return hooks as typeof hooks & { dispose: typeof dispose; statusForSession: typeof statusForSession };
 };
 
 function estimateFillFromSession(store: SessionStore, model?: string): number {
