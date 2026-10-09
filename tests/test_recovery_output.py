@@ -113,9 +113,10 @@ def test_actual_archive_expand_hook_round_trip(tmp_path):
 
 
 def test_own_expand_session_selector_is_protected():
+    import shlex
     from recovery_output import is_expand_command
-    assert is_expand_command(f'python3 {SCRIPTS / "measure.py"} expand original --session session')
-    assert not is_expand_command(f'python3 {SCRIPTS / "measure.py"} expand --list')
+    assert is_expand_command(f'python3 {shlex.quote(str(SCRIPTS / "measure.py"))} expand original --session session')
+    assert not is_expand_command(f'python3 {shlex.quote(str(SCRIPTS / "measure.py"))} expand --list')
 
 
 def test_no_recovery_savings_events(tmp_path):
