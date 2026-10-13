@@ -646,6 +646,11 @@ def test_forged_exact_digest_temp_record_refused(tmp_path,monkeypatch):
     assert foreign.read_text()=='unrelated private note'
 
 
+def test_closedset_suite_uses_devin_isolation():
+    from conftest import _DEVIN_TEST_FILES
+    assert 'test_devin_closedset.py' in _DEVIN_TEST_FILES
+
+
 def test_ambient_overrides_are_isolated(tmp_path):
     from conftest import _devin_isolated_env
     ambient = {'HOME': '/foreign/home', 'USERPROFILE': '/foreign/profile',
