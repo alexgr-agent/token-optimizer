@@ -508,8 +508,9 @@ def test_v6_initial_failures_are_clean_refusals(tmp_path,monkeypatch,entry,failu
     else:(root/'devin_state.py').unlink()
     run=subprocess.run([sys.executable,str(root/entry),'--help'],capture_output=True,timeout=15)
     assert run.returncode==2 and b'bootstrap manifest gate refused' in run.stderr
-    reason=b'maximum recursion depth' if failure=='recursive_manifest' else b'manifested payload source missing'
-    assert reason in run.stderr and b'Traceback' not in run.stderr
+    # JSON nesting limits and recursion messages vary between Python runtimes.
+    reasons=(b'invalid bootstrap manifest',b'maximum recursion depth',b'Stack overflow') if failure=='recursive_manifest' else (b'manifested payload source missing',)
+    assert any(reason in run.stderr for reason in reasons) and b'Traceback' not in run.stderr
 
 
 @pytest.mark.parametrize('entry',['devin_state.py','devin_verify.py'])
@@ -603,8 +604,12 @@ def test_v8_installer_recursive_metadata_refuses_cleanly(tmp_path,monkeypatch,ac
     monkeypatch.setenv('HOME',str(tmp_path));d.install();target=d.state.data_dir()/leaf
     target.write_bytes(b'['*20000+b']'*20000);target.chmod(0o600);before=target.read_bytes()
     run=subprocess.run([sys.executable,str(SCRIPTS/'devin_install.py'),action],capture_output=True,timeout=15)
-    assert run.returncode==2 and b'maximum recursion depth' in (run.stdout+run.stderr)
-    assert b'Traceback' not in run.stderr and target.read_bytes()==before
+    # A runtime may decode this array and reject its shape instead of recursing.
+    invalid=b'invalid ownership record' if leaf=='install.json' else b'invalid pending install record; manual inspection required'
+    shape_refusal=run.returncode==1 and run.stderr==b'Devin install refused: '+invalid+b'\n'
+    recursion_refusal=run.returncode==2 and run.stderr.startswith(b'Devin install refused: ') and any(reason in run.stderr for reason in (b'maximum recursion depth',b'Stack overflow'))
+    assert shape_refusal or recursion_refusal
+    assert not run.stdout and b'Traceback' not in run.stderr and target.read_bytes()==before
 
 
 @pytest.mark.parametrize('source',[b'"""doc"""; import os\n',b'from __future__ import annotations; import os\n'])
