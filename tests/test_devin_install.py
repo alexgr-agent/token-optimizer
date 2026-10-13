@@ -173,7 +173,8 @@ def test_absent_desktop_and_cli_are_separate_facts(tmp_path, monkeypatch):
     assert facts['cli_on_path'] is False
 
 
-@pytest.mark.parametrize('content',[b'\xff',b'[]',b'{',b'{"applicationName":"windsurf"}',b'x' * (1024*1024+1)])
+@pytest.mark.parametrize('content',[b'\xff',b'[]',b'{',b'{"applicationName":"windsurf"}',b'x' * (1024*1024+1)],
+                         ids=['invalid-utf8', 'array', 'invalid-json', 'other-app', 'oversized'])
 def test_desktop_metadata_unusable_is_not_presence(tmp_path, monkeypatch, content):
     import devin_doctor as d
     root=tmp_path/'app';root.mkdir();(root/'product.json').write_bytes(content)
