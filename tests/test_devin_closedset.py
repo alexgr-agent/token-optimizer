@@ -242,11 +242,17 @@ else:raise AssertionError('changed source loaded')
 
 def test_upgrade_clean_229_install(tmp_path, monkeypatch):
     import devin_install as d,subprocess
-    monkeypatch.setenv('HOME',str(tmp_path));repo=SCRIPTS.parents[2];baseline=tmp_path/'baseline'
-    for name in d.PAYLOAD+('devin_install.py',):
-        target=baseline/'skills/token-optimizer/scripts'/name;target.parent.mkdir(parents=True,exist_ok=True)
-        target.write_bytes(subprocess.check_output(['git','show','a78de1a:skills/token-optimizer/scripts/'+name],cwd=repo))
-    skill=baseline/'devin/SKILL.md';skill.parent.mkdir();skill.write_bytes(subprocess.check_output(['git','show','a78de1a:devin/SKILL.md'],cwd=repo))
+    import hashlib, zipfile
+    monkeypatch.setenv('HOME',str(tmp_path));baseline=tmp_path/'baseline'
+    fixture=Path(__file__).parent/'fixtures/devin-229-a78de1a.zip'
+    assert hashlib.sha256(fixture.read_bytes()).hexdigest()=='2cc439dcf827caada05eee14351131a68ce3ff595f35500ca73b4991ef48c5fb'
+    with zipfile.ZipFile(fixture) as archive:
+        for name in d.PAYLOAD+('devin_install.py',):
+            relative='skills/token-optimizer/scripts/'+name
+            target=baseline/relative;target.parent.mkdir(parents=True,exist_ok=True)
+            target.write_bytes(archive.read(relative))
+        skill=baseline/'devin/SKILL.md';skill.parent.mkdir()
+        skill.write_bytes(archive.read('devin/SKILL.md'))
     run=subprocess.run([sys.executable,str(baseline/'skills/token-optimizer/scripts/devin_install.py'),'install'],env=dict(os.environ),capture_output=True,timeout=20)
     assert run.returncode==0,run.stderr
     d.install()
