@@ -1,6 +1,6 @@
 ---
 title: Devin
-description: "Contract-only beta: explicit captured-output filtering through a user-triggered Devin CLI skill, not automatic hooks."
+description: "Contract-only beta: explicit captured-output filtering through a user-triggered Devin CLI / Desktop Devin Local skill, not automatic hooks."
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -17,7 +17,7 @@ Prepare a private capture pair, run a finite foreground command in the native sh
 
 The filter reads only prepared owner-only regular files bounded at 8 MiB each. It refuses symlinks, hardlinks, substitutions and changed seals. Failures, stderr, invalid UTF-8/control data and recognized credentials remain raw. Raw passthrough is not redaction and can expose private content to Devin/model context. Compression is lossy.
 
-A compressed result carries an opaque capture ID. Recovery validates the pair and seal again. Captures persist until explicitly cleaned up; the adapter makes no second durable raw copy. Other imported Claude hooks may make their own copies and are outside this adapter's control.
+A compressed result carries an opaque capture ID. Recovery validates the pair and seal again. Compressed captures persist until explicitly cleaned up or purged; raw-passthrough captures are removed after delivery; the adapter makes no second durable raw copy. Other imported Claude hooks may make their own copies and are outside this adapter's control.
 
 ## What is measured
 
@@ -26,3 +26,9 @@ A compressed result carries an opaque capture ID. Recovery validates the pair an
 See [Devin install](/install/devin/), [Configuration](/reference/configuration/#devin), [CLI](/reference/cli/#devin) and the [capability matrix](/reference/capability-matrix/#devin).
 
 Hosted Devin has an optional manual playbook template in the repository. It is not deployed or live-tested. Knowledge/playbooks deliver instructions, not automatic interception. [Primary skill contract](https://docs.devin.ai/cli/extensibility/skills/creating-skills) and [hook contract](https://docs.devin.ai/cli/extensibility/hooks).
+
+## Desktop: Devin Local contract
+
+[Devin Local](https://docs.devin.ai/desktop/devin-local) shares the CLI harness, skills format and discovery. This adapter targets that documented contract, not Cascade or other ACP agents. Desktop loading and execution remain unverified.
+
+Select Devin Local, leave Restricted Mode, and open Customizations to check that `token-optimizer-output` loaded from the intended user skill. Invoke it explicitly. Install in the agent's actual POSIX HOME; native Windows is unsupported, and WSL does not prove Windows Desktop uses the Linux install. Doctor reports bounded metadata heuristics and local probes, not authenticated Desktop availability or execution. See [install steps](/install/devin/).

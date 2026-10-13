@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import pytest
 import os
@@ -430,6 +431,7 @@ def test_release_inventory_includes_template():
     inventory=script.split('ls-files',1)[1].split('| sort',1)[0]
     assert 'devin/SKILL.md' in inventory
 
+@pytest.mark.skipif(shutil.which('git') is None, reason='git required for sparse checkout fixture')
 def test_skills_only_sparse_checkout_materializes_pinned_template(tmp_path):
     import shutil
     repo=tmp_path/'repo';repo.mkdir()
@@ -485,6 +487,7 @@ d._atomic=atomic;d.install()
     run=subprocess.run([sys.executable,str(SCRIPTS/'devin_install.py'),'install'],env=env,capture_output=True);assert run.returncode==0,run.stderr
     assert not (tmp_path/'.config/devin/token-optimizer/pending-install.json').exists()
 
+@pytest.mark.skipif(shutil.which('git') is None, reason='git required for sparse checkout fixture')
 @pytest.mark.parametrize('mode',['fresh','candidate-update'])
 def test_verified_release_sparse_checksum_end_to_end(tmp_path,mode):
     """Execute the installer's actual checksum verifier on its sparse cone."""
@@ -876,7 +879,8 @@ def test_purge_dry_run_says_captures_will_be_removed(tmp_path, monkeypatch, caps
     inst.uninstall(dry_run=True, purge=True)
     text = capsys.readouterr().out
     assert 'captures remain unchanged' not in text
-    assert _re.search(r'captures will be removed|removes? (stored )?captures|deletes? (stored )?captures', text)
+    assert 'fixed stored-capture leaves' in text
+    assert 'foreign capture content is preserved' in text
 
 
 def test_install_text_describes_automatic_passthrough_removal(tmp_path, monkeypatch, capsys):

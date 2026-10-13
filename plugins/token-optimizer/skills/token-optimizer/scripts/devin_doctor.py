@@ -78,7 +78,6 @@ if not _source_development:
         raise ImportError(_bootstrap_message) from None
 
 
-
 try:
     import devin_state as state
 except (ImportError, SyntaxError) as _initial_error:
@@ -89,13 +88,70 @@ except (ImportError, SyntaxError) as _initial_error:
     raise ImportError(_initial_message) from None
 
 
+def _desktop_app_roots():
+    """Heuristic locations/layout only, not an authoritative app inventory."""
+    # Candidate paths and applicationName are unverified heuristics; vendor
+    # documentation does not list them as a supported detection interface.
+    return [Path('/Applications/Devin.app/Contents/Resources/app'),
+            Path.home() / 'Applications/Devin.app/Contents/Resources/app',
+            Path.home() / '.local/share/Devin/resources/app']
+
+
+def local_agent_surfaces() -> dict:
+    desktop = []
+    bundled = []
+    for root in _desktop_app_roots():
+        try:
+            state.no_symlinks(root)
+            product = root / 'product.json'
+            fd = os.open(product, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 1024 * 1024:
+                    continue
+                # Regular-file reads stay bounded; O_NONBLOCK avoids waiting on
+                # a special-file substitution before the fstat refusal above.
+                raw = os.read(fd, 1024 * 1024 + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > 1024 * 1024:
+                continue
+            metadata = json.loads(raw)
+            if not isinstance(metadata, dict) or metadata.get('applicationName') != 'devin-desktop':
+                continue
+            desktop.append(str(root))
+            # Historical Windsurf-layout candidate, not a required dependency.
+            agent = root / 'extensions/windsurf/devin/bin/devin'
+            try:
+                state.no_symlinks(agent)
+                if stat.S_ISREG(agent.lstat().st_mode):
+                    bundled.append(str(agent))
+            except OSError:
+                pass
+        except (OSError, ValueError, TypeError, RuntimeError):
+            continue
+    return {
+        'cli_on_path': bool(shutil.which('devin')),
+        'desktop_bundle_present': bool(desktop),
+        'bundled_agent_file_found': bool(bundled),
+        'desktop_bundle_paths': desktop,
+        'bundled_agent_paths': bundled,
+        'desktop_search_scope': 'heuristic paths and product/layout match; relocated, remote and other installs may be missed',
+        'desktop_presence_basis': 'filesystem metadata only; product.json is not authenticated',
+        'desktop_loading_verified': False,
+        'desktop_execution_verified': False,
+    }
+
 
 def diagnose(probe=False):
     root = state.data_dir()
     skill = state.home() / 'skills/token-optimizer-output/SKILL.md'
+    recovery_pending = (root/'pending-install.json').exists() or (root/'pending-install.json').is_symlink()
     from devin_verify import verify_install
     error=None
     try:
+        for leaf in ('metrics.db', 'session-salt', 'metrics.db-journal', 'metrics.db-wal', 'metrics.db-shm'):
+            state.private_path(root / leaf)
         ready=verify_install()
         from devin_verify import PAYLOAD
         # Import the whole manifested payload through the digest-checked
@@ -116,6 +172,19 @@ def diagnose(probe=False):
     except (OSError,ValueError,SyntaxError,TypeError,subprocess.SubprocessError) as exc:
         ready=False;error=str(exc)
     warnings = []
+    if recovery_pending:
+        ready = False
+        error = (error + '; ' if error else '') + 'Recovery is pending'
+        try:
+            state.private_path(root / 'pending-install.json')
+        except OSError as exc:
+            error += ': ' + str(exc)
+            if (root / 'pending-install.json').is_dir() and not (root / 'pending-install.json').is_symlink():
+                warnings.append(error + '; directory-shaped pending state cannot be recovered or purged. Move it aside after inspecting it.')
+            else:
+                warnings.append(error + '; ordinary recovery refuses this path. Move it aside or use uninstall --purge to discard adapter state and stored captures.')
+        else:
+            warnings.append('Recovery is pending; real install/uninstall validates and attempts recovery, but invalid transaction contents can still refuse. Dry-run refuses pending recovery.')
     for name in ('.claude/settings.json', '.claude.json'):
         if (Path.home() / name).is_file():
             warnings.append('Claude config exists and Devin imports may load its hooks: ' + name)
@@ -128,8 +197,12 @@ def diagnose(probe=False):
     for base in (Path.cwd()/'.devin',Path.cwd()/'.claude'):
         if (base/'skills/token-optimizer-output/SKILL.md').exists():
             warnings.append('Project token-optimizer-output skill can shadow installed global skill: '+str(base))
-    result = {'surface': 'explicit_capture_filter', 'status': 'contract-only beta',
-              'installed': ready, 'readiness_error': error, 'devin_cli_on_path': bool(shutil.which('devin')),
+    loader = state.loader_path_info()
+    if loader['status'] != 'documented_default':
+        warnings.append('Nondefault skill directory: CLI/Desktop discovery is unverified; check the loaded skill source.')
+    surfaces = local_agent_surfaces()
+    result = {'recovery_pending': recovery_pending, 'local_agent_surfaces': surfaces, 'loader_path': loader, 'surface': 'explicit_capture_filter', 'status': 'recovery-pending' if recovery_pending else 'contract-only beta',
+              'installed': ready, 'readiness_error': error, 'devin_cli_on_path': surfaces['cli_on_path'],
               'live_devin_session_tested': False, 'warnings': warnings,
               'local_probe_passed': None}
     if probe and ready:
@@ -137,9 +210,9 @@ def diagnose(probe=False):
         tmp = state.prepare_capture()
         out, err = tmp / 'stdout', tmp / 'stderr'
         raw = b'repeated output line\n' * 1000
-        out.write_bytes(raw); err.write_bytes(b'')
-        seal_capture(tmp, 0)
         try:
+            out.write_bytes(raw); err.write_bytes(b'')
+            seal_capture(tmp, 0)
             value = filter_capture(out, err, 0, 'generic', 'doctor-local-probe', record_metrics=False)
             result['local_probe_passed'] = value.code == 0 and len(value.stdout) < len(raw) and out.read_bytes() == raw
         finally:
@@ -157,7 +230,7 @@ def main(argv=None):
     try:
         result=diagnose(args.probe); print(json.dumps(result,indent=2))
         return 0 if result['installed'] and result['local_probe_passed'] is not False else 1
-    except (OSError, ValueError, ImportError, SyntaxError, RecursionError) as exc:
+    except (OSError, ValueError, ImportError, SyntaxError, RecursionError, RuntimeError) as exc:
         print('Token Optimizer: readiness refused: '+str(exc)+'. Originals remain unchanged.',file=sys.stderr)
         return 2
 

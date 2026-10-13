@@ -19,6 +19,12 @@ Installation records consent: filtering/passthrough/recovery may show confidenti
 
 Run `devin skills show token-optimizer-output` to check the selected source and `Triggers: user`. A same-named project skill can shadow the global skill. Doctor's probe is local, not a live Devin model test.
 
+## Desktop: Devin Local
+
+Install in the same POSIX HOME/environment used by Desktop's local agent. Select Devin Local, enabling it in Devin User Settings > Agents and restarting if needed. Team/admin access may also be required; Restricted Mode disables agents. Open Customizations from the new-tab menu or the right-click menu on a Devin Local session in the agent sidebar to verify the selected user skill, then invoke `/token-optimizer-output` explicitly. Cascade and other ACP agents are not covered. Desktop loading/execution have not been live-tested.
+
+For loader overrides, WSL boundaries, diagnostics and current limitations, see [the full Desktop contract](/platforms/devin/#desktop-devin-local-contract) and the repository's `devin/README.md`. [Primary Desktop contract](https://docs.devin.ai/desktop/devin-local).
+
 ## Capture workflow
 
 Read the repository's `devin/README.md` for the exact prepare, native redirection, seal and filter sequence. Use new pre-created 0600 files for each completed foreground command; never background the producer or run interactive input through capture. Do not display full successful output before filtering. Small output should skip this workflow because orchestration can outweigh reduction.

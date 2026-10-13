@@ -176,6 +176,26 @@ def _ownership_for_removal(*, purge: bool):
         return None
 
 
+
+def _purge_record_bytes(path):
+    """Purge may recover historical digests from loose-mode or linked records."""
+    state.no_symlinks(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 8 * 1024 * 1024:
+            raise OSError('bounded regular purge record required: ' + str(path))
+        with os.fdopen(fd, 'rb') as handle:
+            fd = -1
+            content = handle.read(8 * 1024 * 1024 + 1)
+        if len(content) > 8 * 1024 * 1024:
+            raise OSError('purge record too large: ' + str(path))
+        return content
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _purge_recorded() -> dict:
     """Best-effort recorded digests for the purge sweep: a well-formed
     manifest or pending transaction record contributes the digests it
@@ -196,7 +216,7 @@ def _purge_recorded() -> dict:
 
     for leaf in ('install.json', 'pending-install.json'):
         try:
-            record = json.loads((state.data_dir() / leaf).read_bytes())
+            record = json.loads(_purge_record_bytes(state.data_dir() / leaf))
         except (OSError, ValueError, RecursionError):
             continue
         if not isinstance(record, dict) or record.get('owner') != MARKER:
@@ -370,6 +390,88 @@ def _recover_pending() -> None:
     _clear_pending(pending)
 
 
+def _preflight_state_files(root):
+    for leaf in ('install.lock', 'consent.json', 'pending-install.json',
+                 'metrics.db', 'session-salt', 'metrics.db-journal', 'metrics.db-wal', 'metrics.db-shm'):
+        state.private_path(root / leaf)
+
+
+def _preflight_ancestors(root, skill):
+    for destination in (root, skill):
+        for ancestor in reversed(destination.parents):
+            if not ancestor.exists():
+                continue
+            info = ancestor.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise OSError('install ancestor is not a directory: ' + str(ancestor))
+            if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+                raise OSError('group/other-writable ancestor directory refused: ' + str(ancestor))
+
+
+
+def _preflight_write_access(root, skill):
+    """Check effective access without creating leaves; ACL inheritance may differ."""
+    for destination in (root, root / 'plugin', skill):
+        cursor = destination
+        while not cursor.exists():
+            cursor = cursor.parent
+        mode = os.W_OK | os.X_OK
+        if cursor == destination:
+            mode |= os.R_OK
+        if not os.access(cursor, mode, effective_ids=True):
+            raise OSError('install destination is not readable/writable/searchable: ' + str(cursor))
+        for ancestor in cursor.parents:
+            if not os.access(ancestor, os.X_OK, effective_ids=True):
+                raise OSError('install ancestor is not searchable: ' + str(ancestor))
+    lock = root / 'install.lock'
+    if lock.exists() and not os.access(lock, os.R_OK | os.W_OK, effective_ids=True):
+        raise OSError('install lock is not readable/writable: ' + str(lock))
+
+
+def _preflight_removal_access(root, skill, owned, *, purge=False):
+    destinations = [root]
+    if owned:
+        destinations.extend(Path(name).parent for name in owned['files'])
+    else:
+        destinations.extend(folder for folder in (root / 'plugin', skill) if not (purge and folder.is_symlink()))
+    for folder in set(destinations):
+        if folder.exists() and not os.access(folder, os.W_OK | os.X_OK, effective_ids=True):
+            raise OSError('removal directory is not writable/searchable: ' + str(folder) + '; inspect it and move it aside before retrying removal')
+    cache = root / 'plugin' / '__pycache__'
+    if purge and not owned and (root / 'plugin').is_symlink():
+        cache = None  # Foreign symlink targets are never inspected or removed.
+    if cache is not None:
+        state.no_symlinks(cache)
+    if cache is not None and cache.exists():
+        if not cache.is_dir():
+            raise OSError('removal cache is not a directory; preserved: ' + str(cache))
+        if not os.access(cache, os.R_OK | os.W_OK | os.X_OK, effective_ids=True):
+            raise OSError('removal cache is not readable/writable/searchable: ' + str(cache))
+    lock = root / 'install.lock'
+    if lock.exists() and not os.access(lock, os.R_OK | os.W_OK, effective_ids=True):
+        raise OSError('install lock is not readable/writable: ' + str(lock))
+
+
+def _preflight_destination(root, skill):
+    _preflight_ancestors(root, skill)
+    _preflight_state_files(root)
+    state.private_path(root, directory=True)
+    state.private_path(root / 'plugin', directory=True)
+    owned = _ownership()
+    if not owned and (skill.exists() or (root / 'plugin').exists()):
+        existing = [str(folder) for folder in (skill, root / 'plugin') if folder.exists()]
+        raise OSError('foreign install destination already exists: ' + ', '.join(existing) + '; move aside or remove and retry')
+    state.private_path(skill, directory=True)
+    if owned:
+        actual = {str(p) for folder in (skill, root / 'plugin') for p in folder.rglob('*')
+                  if p.is_file() and '__pycache__' not in p.parts}
+        recorded = set(_resolved_files(owned['files']))
+        if actual != recorded:
+            strays = sorted(actual - recorded)
+            raise OSError('unowned files in install destination: ' + ', '.join(strays) + '; move aside or remove and retry')
+    return owned
+
+
 def install(*, dry_run=False) -> None:
     if os.name != 'posix':
         raise OSError('native Windows unsupported; use a POSIX environment')
@@ -384,24 +486,20 @@ def install(*, dry_run=False) -> None:
     for name in PAYLOAD:
         if not (SCRIPTS / name).is_file():
             raise OSError('missing payload: ' + name)
+    if state.loader_path_info()['status'] != 'documented_default':
+        print('Warning: nondefault Devin home; Desktop discovery is unverified. Check the loaded skill in Desktop Customizations; this installer does not configure its loader.')
+    _preflight_ancestors(root, skill)
+    _preflight_state_files(root)
     if dry_run:
+        if (root / 'pending-install.json').exists():
+            raise OSError('dry-run cannot predict recovery and refuses while recovery is pending')
+        _preflight_destination(root, skill)
+        _preflight_write_access(root, skill)
         print('Would install explicit Devin output skill at ' + str(skill))
         return
     with _lock():
         _recover_pending()
-        owned = _ownership()
-        if not owned and (skill.exists() or (root / 'plugin').exists()):
-            present = [str(p) for p in (skill, root / 'plugin') if p.exists()]
-            raise OSError('foreign install destination already exists: ' + ', '.join(present) +
-                          '; move them aside or remove them and retry')
-        if owned:
-            # Extra files are not owned; do not erase or publish over them.
-            actual = {str(p) for folder in (skill, root / 'plugin') for p in folder.rglob('*') if p.is_file() and '__pycache__' not in p.parts}
-            recorded = set(_resolved_files(owned['files']))
-            if actual != recorded:
-                stray = sorted(actual - recorded) + sorted(recorded - actual)
-                raise OSError('unowned files in install destination: ' + ', '.join(stray) +
-                              '; remove them to retry')
+        owned = _preflight_destination(root, skill)
         # Fresh installs roll back only leaves/directories created by this attempt.
         # Refresh retains old bytes and manifest until a complete update succeeds.
         old_bytes={name:Path(name).read_bytes() for name in owned['files']} if owned else {}
@@ -457,24 +555,82 @@ def install(*, dry_run=False) -> None:
     print('Numeric local estimates retain 30 days, at most 10000 rows.')
 
 
+def _preflight_purge(root):
+    # Purge removes state leaves by name, even unsafe modes/links. It cannot
+    # unlink directories: detect those before removing any owned payload.
+    for name in ('metrics.db', 'metrics.db-journal', 'metrics.db-wal', 'metrics.db-shm',
+                 'consent.json', 'session-salt', 'install.json', 'pending-install.json'):
+        leaf = root / name
+        if leaf.is_dir() and not leaf.is_symlink():
+            raise OSError('purge state leaf is a directory; preserved: ' + str(leaf))
+
+    captures = root / 'captures'
+    state.no_symlinks(captures)
+    if captures.exists():
+        if not captures.is_dir():
+            raise OSError('purge captures root is not a directory: ' + str(captures))
+        if not os.access(captures, os.R_OK | os.W_OK | os.X_OK, effective_ids=True):
+            raise OSError('captures root is not readable/writable/searchable: ' + str(captures))
+        # delete_capture opens every absolute component O_RDONLY|O_DIRECTORY.
+        # Verify that descriptor walk before any state/payload removal.
+        folders = list(captures.iterdir())
+        if any(folder.is_dir() and not folder.is_symlink() and re.fullmatch(r'capture-[0-9a-f]{32}', folder.name) for folder in folders):
+            try:
+                fd = state.directory_fd(captures)
+                os.close(fd)
+            except OSError as exc:
+                raise OSError('capture descriptor path refused: ' + str(captures) + '; inspect ancestors and move state aside if needed: ' + str(exc)) from exc
+        for folder in folders:
+            if not folder.is_dir() or folder.is_symlink() or not re.fullmatch(r'capture-[0-9a-f]{32}', folder.name):
+                continue
+            state.private_path(folder, directory=True)
+            if not os.access(folder, os.R_OK | os.W_OK | os.X_OK, effective_ids=True):
+                raise OSError('capture directory is not writable/searchable: ' + str(folder))
+            for name in ('stdout', 'stderr', '.prepared', 'complete.json'):
+                state.no_symlinks(folder / name)
+                leaf = folder / name
+                if leaf.exists() and not stat.S_ISREG(leaf.lstat().st_mode):
+                    raise OSError('purge capture leaf must be regular: ' + str(leaf))
+
+
 def uninstall(*, dry_run=False, purge=False) -> None:
     if os.name != 'posix':
         raise OSError('native Windows unsupported')
+    root = state.data_dir()
+    if (not root.exists() and not root.is_symlink()
+            and not skill_dir().exists() and not skill_dir().is_symlink()):
+        print('No owned Devin install found.')
+        return
+    state.private_path(root, directory=True)
+    state.private_path(root / 'install.lock')
+    if purge:
+        _preflight_purge(root)
+    pending = root / 'pending-install.json'
+    if dry_run and not purge and (pending.exists() or pending.is_symlink()):
+        state.private_path(pending)
+        raise OSError('dry-run refuses while recovery is pending')
     # Purge is independent of an install manifest: plain uninstall may precede it.
     # Under purge a stale or foreign-version pending record is deleted, not
     # reconciled, so it must never block the purge path.
     if not dry_run and not purge:
         with _lock():_recover_pending()
     owned = _ownership_for_removal(purge=purge)
-    if dry_run:
-        print('Would remove owned files and requested numeric state' +
-              ('; stored captures will be removed.' if purge else '; captures remain unchanged.'))
-        return
+    _preflight_removal_access(root, skill_dir(), owned, purge=purge)
     if not owned and not purge:
         print('No owned Devin install found.')
         return
+    if dry_run:
+        if purge:
+            print('Would remove unchanged owned files, numeric state and fixed stored-capture leaves; foreign capture content is preserved.')
+        else:
+            print('Would remove owned skill/payload; numeric state and captures remain unchanged.')
+        return
     with _lock():
+        if purge:
+            # Recheck after taking the lock: preflight paths may have changed.
+            _preflight_purge(root)
         owned = _ownership_for_removal(purge=purge)
+        _preflight_removal_access(root, skill_dir(), owned, purge=purge)
         if purge:
             recorded = _purge_recorded()
             known = _known_payload_digests()
@@ -483,13 +639,15 @@ def uninstall(*, dry_run=False, purge=False) -> None:
                 Path(name).unlink(missing_ok=True)
             manifest_path().unlink(missing_ok=True)
         cache = state.data_dir() / 'plugin' / '__pycache__'
-        if cache.exists():
+        if cache.exists() and not (purge and not owned and (state.data_dir() / 'plugin').is_symlink()):
             state.no_symlinks(cache)
-            for item in cache.iterdir():
-                if item.name.endswith('.pyc') and item.is_file() and not item.is_symlink():
-                    item.unlink()
-            try: cache.rmdir()
-            except OSError: pass
+            try:
+                for item in cache.iterdir():
+                    if item.name.endswith('.pyc') and item.is_file() and not item.is_symlink():
+                        item.unlink()
+                cache.rmdir()
+            except OSError:
+                print('Cache content was preserved under ' + str(cache) + '; inspect it before retrying removal.')
         for folder in (skill_dir(), state.data_dir() / 'plugin'):
             try: folder.rmdir()
             except OSError: pass
@@ -509,7 +667,11 @@ def uninstall(*, dry_run=False, purge=False) -> None:
                     state.no_symlinks(folder)
                 except OSError:
                     continue
-                for item in folder.iterdir():
+                try:
+                    items = list(folder.iterdir())
+                except OSError:
+                    continue  # Preserve unreadable foreign content, then purge captures.
+                for item in items:
                     if not item.is_file() or item.is_symlink():
                         continue
                     try:
@@ -533,11 +695,12 @@ def uninstall(*, dry_run=False, purge=False) -> None:
                     state.delete_capture(folder)
                 try: captures.rmdir()
                 except OSError: pass
-            remaining = [str(folder) for folder in (state.data_dir() / 'plugin', skill_dir()) if folder.exists()]
+            remaining = [str(folder) for folder in (state.data_dir() / 'plugin', skill_dir(), captures) if folder.exists()]
             if remaining:
                 print('Unowned or edited files were preserved under ' + ' and '.join(remaining) +
                       '; inspect them and move the folders aside to finish removing the adapter.')
-            print('Purged numeric metrics, SQLite sidecars, consent, HMAC key and stored captures.')
+            print('Purged numeric metrics, SQLite sidecars, consent and HMAC key.' +
+                  (' Some capture content was preserved; inspect the reported captures directory.' if captures.exists() else ' Stored captures removed.'))
     if not purge:
         print('Original captures unchanged.')
     print('Removed owned Devin skill/payload.')

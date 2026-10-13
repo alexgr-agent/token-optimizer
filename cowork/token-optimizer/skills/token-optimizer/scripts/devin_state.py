@@ -43,6 +43,17 @@ def home() -> Path:
     return candidate.resolve()
 
 
+def loader_path_info() -> dict:
+    """Documented loader location, not evidence that an agent loaded the skill."""
+    documented = Path.home().resolve() / '.config' / 'devin'
+    installed = home()
+    return {
+        'documented_home': str(documented),
+        'installed_home': str(installed),
+        'status': 'documented_default' if installed == documented else 'nondefault_discovery_unknown',
+        'desktop_loading_verified': False,
+    }
+
 
 def data_dir() -> Path:
     return home() / 'token-optimizer'
@@ -90,10 +101,12 @@ def private_path(path: Path, *, directory=False, create=False) -> Path:
     except FileNotFoundError:
         return path
     else:
-        if info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1 and not directory:
-            raise OSError('adapter state must be owner-only')
+        if not directory and not stat.S_ISREG(info.st_mode):
+            raise OSError('regular state file required: ' + str(path))
         if directory != stat.S_ISDIR(info.st_mode):
-            raise OSError('unexpected state type')
+            raise OSError('unexpected state type: ' + str(path))
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1 and not directory:
+            raise OSError('adapter state must be owner-only: ' + str(path))
     return path
 
 
