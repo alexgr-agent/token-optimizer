@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Tool-call fatigue warnings now scale with the session's effective context window instead of staying at the 200K thresholds (25/40 calls). A 1M window uses 202/324 calls; smaller session windows and explicit compact-window limits keep earlier warnings.
+
 ## [5.13.46] - 2026-10-15
 
 - `git log` output now compresses: for the default format, every commit becomes one line (10-character hash, date, author name, subject), with bodies, trailers and author emails condensed to counts and Co-authored-by names kept. `git log -60` on this repo drops from about 6,100 to 2,300 estimated tokens, so the automatic Devin path now delivers it compressed instead of raw. A commit cut off by `| head` is listed as truncated instead of guessed. Every other shape is delivered exactly as git printed it: `--oneline`, `--format`, `--pretty`, `-z`, `--porcelain`, `--show-signature`, `--stat`, `--name-status`, `--name-only`, `--numstat`, `--graph`, `-p`, `-L` and output that does not parse cleanly.

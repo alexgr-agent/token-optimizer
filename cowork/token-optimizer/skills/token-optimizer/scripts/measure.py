@@ -35094,17 +35094,13 @@ _FILL_WARN_THRESHOLDS = [
 # warnings are gated on fill_pct >= 50% in compute_quality_score() because at
 # low fill, tool calls don't cause instruction adherence issues regardless of
 # count. Env var overrides still take precedence.
-def _scaled_tool_call_thresholds():
+def _scaled_tool_call_thresholds(ctx_size):
     """Compute tool call thresholds scaled by context window size.
 
     Uses superlinear scaling (x^1.3) because on 1M windows, tool results
     are a much smaller fraction of the context. Linear 5x was too
     conservative: it warned at 125 calls on 1M even at 15% fill.
     """
-    try:
-        ctx_size, _ = detect_context_window()
-    except Exception:
-        ctx_size = 200_000
     scale = max(1.0, (ctx_size / 200_000) ** 1.3)
     base_warn = 25
     base_crit = 40
@@ -35112,11 +35108,15 @@ def _scaled_tool_call_thresholds():
     crit = _int_env("TOKEN_OPTIMIZER_TOOL_CALL_CRITICAL", int(base_crit * scale))
     return warn, crit
 
-_TOOL_CALL_WARN, _TOOL_CALL_CRITICAL = _scaled_tool_call_thresholds()
-_TOOL_CALL_WARN_THRESHOLDS = [
-    (_TOOL_CALL_CRITICAL, "CRITICAL", f"{_TOOL_CALL_CRITICAL}+ tool calls, adherence degraded"),
-    (_TOOL_CALL_WARN,     "WARNING",  f"{_TOOL_CALL_WARN}+ tool calls, consider fresh session"),
-]
+def _tool_call_warn_thresholds(context_window):
+    # Import-time detection called helpers not yet defined and fell back to 200K.
+    # Resolve at score time using the same effective window as the fill gate.
+    _TOOL_CALL_WARN, _TOOL_CALL_CRITICAL = _scaled_tool_call_thresholds(context_window)
+    _TOOL_CALL_WARN_THRESHOLDS = [
+        (_TOOL_CALL_CRITICAL, "CRITICAL", f"{_TOOL_CALL_CRITICAL}+ tool calls, adherence degraded"),
+        (_TOOL_CALL_WARN,     "WARNING",  f"{_TOOL_CALL_WARN}+ tool calls, consider fresh session"),
+    ]
+    return _TOOL_CALL_WARN_THRESHOLDS
 
 # Configurable via env vars
 _CHECKPOINT_MAX_FILES = _int_env("TOKEN_OPTIMIZER_CHECKPOINT_FILES", 10)
@@ -36227,7 +36227,7 @@ def compute_quality_score(quality_data, session_id=None):
     tc = quality_data.get("tool_calls", 0)
     tool_call_warning = None
     if fill_pct >= 0.50:
-        for threshold, level, message in _TOOL_CALL_WARN_THRESHOLDS:
+        for threshold, level, message in _tool_call_warn_thresholds(fill_denominator):
             if tc >= threshold:
                 tool_call_warning = {"level": level, "tool_calls": tc, "message": message}
                 break
