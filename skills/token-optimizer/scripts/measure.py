@@ -8,6 +8,9 @@ Usage:
     python3 measure.py quick              # Quick scan: overhead + degradation risk + top offenders
     python3 measure.py quick --json       # Machine-readable quick scan
     python3 measure.py doctor             # Health check: verify all components
+    python3 measure.py cloud-init --target REPO   # Claude Code cloud: write repo-committed hooks (see --help)
+    python3 measure.py cloud-import [PATH]        # Claude Code cloud: import .to-cloud summaries into trends.db
+    python3 measure.py cloud-doctor               # Claude Code cloud: which route is live (doctor does this in a cloud VM)
     python3 measure.py drift              # Drift report: compare against last snapshot
     python3 measure.py report             # Full standalone report
     python3 measure.py snapshot before    # Save pre-optimization snapshot
@@ -4760,6 +4763,22 @@ def doctor(as_json=False):
             checks.append(("OK", "Settings self-heal", "no heal history yet"))
     except Exception:
         pass  # doctor must never fail on heal history
+
+    # Claude Code cloud VM: add which route is live. Additive only: the checks above
+    # (local ~/.claude install, hooks, settings) and the score are unchanged, so this
+    # also leaves Cowork's doctor output as it was, plus one row.
+    try:
+        if os.environ.get("CLAUDE_CODE_REMOTE", "").strip().lower() in ("1", "true", "yes", "on"):
+            import cloud_init
+            _cloud = cloud_init.cloud_doctor()
+            checks.append((
+                "OK" if _cloud["live_route"] != "none" else "!!",
+                "Cloud route",
+                _cloud["live_route"] + " (state is per session; numbers are in-VM self-report; "
+                "run `measure.py cloud-doctor` for details)",
+            ))
+    except Exception:
+        pass  # doctor must never fail on the cloud probe
 
     if as_json:
         result = {
@@ -55643,6 +55662,15 @@ if __name__ == "__main__":
         quick_scan(as_json=output_json)
     elif args[0] == "route":
         _cmd_route(args)
+    elif args[0] == "cloud-init":
+        import cloud_init
+        sys.exit(cloud_init.main_init(args[1:]))
+    elif args[0] == "cloud-doctor":
+        import cloud_init
+        sys.exit(cloud_init.main_doctor(args[1:]))
+    elif args[0] == "cloud-import":
+        import cloud_import
+        sys.exit(cloud_import.main(args[1:]))
     elif args[0] == "doctor":
         output_json = "--json" in args
         if detect_runtime() == "codex":

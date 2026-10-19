@@ -70,21 +70,25 @@ The script install handles updates differently. It re-runs the installer daily a
 
 ## Claude Code cloud sessions
 
-Cloud sessions on claude.ai/code run in a fresh container. They do not read the plugins installed on your own machine, and the `/plugin` command is not available inside them, so the install above does not carry over. Two ways to get Token Optimizer into cloud sessions:
+Cloud sessions on claude.ai/code run on a fresh VM from a fresh clone of your repository. They do not read the plugins installed on your own machine, and the `/plugin` command is not available inside them, so the install above does not carry over.
 
-- **Per account:** enable Token Optimizer for your claude.ai account (Desktop app, **Customize**, plugins). Claude Code then loads it in every cloud session as a synced plugin.
-- **Per repository:** commit the following to the repository's `.claude/settings.json`. Every cloud session on that repository installs the plugin at start (the default network level already allows GitHub).
+Anthropic's [cloud environments](https://code.claude.com/docs/en/cloud-environments) page says plugins and marketplaces declared in a repository's `.claude/settings.json` (`enabledPlugins`, `extraKnownMarketplaces`) are not installed in cloud sessions. Whether a plugin enabled on your claude.ai account syncs into cloud sessions is not settled: Anthropic's settings documentation lists a `syncClaudeAiPlugins` setting, and this has not been verified yet. Do not rely on the plugin in cloud sessions until it is.
 
-```json
-{
-  "extraKnownMarketplaces": {
-    "alexgreensh-token-optimizer": { "source": { "source": "github", "repo": "alexgreensh/token-optimizer" } }
-  },
-  "enabledPlugins": { "token-optimizer@alexgreensh-token-optimizer": true }
-}
+What does reach a cloud session is what you commit to the repository. From a checkout of Token Optimizer, write the cloud kit into your project, review the diff, and commit it yourself (the command never commits or pushes):
+
+```bash
+python3 skills/token-optimizer/scripts/measure.py cloud-init --target /path/to/your/repo
 ```
 
-Inside the session, `claude plugin list` shows the plugin, and any Bash command with long output shows the usual compression banner. Hooks, compression and redaction behave exactly as they do locally. One difference: each cloud session starts with an empty state directory, so the dashboard and audit history cover that session only; nothing is shared across sessions or with your machine.
+The kit adds hooks to `.claude/settings.json`, a small script bundle under `.claude/to-cloud/`, and a short skill. In a cloud session the hooks compress large Bash output and keep the original recoverable for that session.
+
+Limits:
+
+- Claude Code cloud only, and only single-repository sessions. Cowork is not covered; whether hooks run in Cowork cloud sessions is unverified.
+- State lives in the VM and is gone when the session ends.
+- Two outputs are opt-in and off by default: `--state-out` writes a metadata-only summary to `.to-cloud/<session-id>.json`, and `--continuity` writes `.to-cloud/checkpoints/latest.json` (git branch and commit, repo-relative paths of edited files, counters) and restores it as plain data at the next cloud SessionStart. Neither holds prompts, code, file contents or tool output, and Token Optimizer never commits or pushes them.
+- `measure.py cloud-import` loads those files into your local `trends.db` as a separate table labeled `platform=claude-code-cloud`. They are an in-VM self-report with Token Optimizer's own token estimates, not provider-reported usage, and are never mixed into the provider-reported session data.
+- Run `measure.py doctor` in a cloud session, or `python3 .claude/to-cloud/to_cloud_hook.py doctor`, to see which route is live.
 
 ## Windows note
 
