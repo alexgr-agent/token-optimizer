@@ -22,7 +22,7 @@ REPO_MODULES = frozenset((
     'build_output_compress', 'codex_command_compress', 'codex_compact_prompt', 'codex_doctor',
     'codex_hook_bridge', 'codex_install', 'codex_io', 'codex_log_index', 'codex_models',
     'codex_session', 'codex_state', 'codex_statusline', 'command_filters',
-    'compression_backfill', 'compression_log', 'context_intel', 'context_pressure',
+    'compression_backfill', 'cloud_expand', 'cloud_hook', 'cloud_import', 'cloud_init', 'compression_log', 'context_intel', 'context_pressure',
     'copilot_doctor', 'copilot_hook_bridge', 'copilot_install', 'copilot_session',
     'copilot_state', 'copilot_vscode', 'cowork_doctor', 'cowork_install',
     'credential_patterns', 'cursor_doctor', 'cursor_hook_bridge', 'cursor_install',
