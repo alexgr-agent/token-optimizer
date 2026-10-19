@@ -241,6 +241,7 @@ def test_hooks_never_fail_the_session(repo, tmp_path):
             assert r.returncode == 0, (ev, junk, r.stderr)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="cloud sessions run on Linux; this case needs POSIX sh, paths and temp semantics")
 def test_hook_command_is_safe_when_script_or_python_is_missing(repo, tmp_path):
     cmd = _hook_cmd(repo, "Stop")
     env = _env(repo, tmp_path)
@@ -502,6 +503,7 @@ def test_symlinked_checkpoint_file_is_not_read(repo, tmp_path):
     assert _fire(repo, env, "SessionStart", {"session_id": "o"}).stdout == ""
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="cloud sessions run on Linux; this case needs POSIX sh, paths and temp semantics")
 def test_state_dir_with_url_special_characters(repo, tmp_path):
     odd = tmp_path / "odd #dir %20 ?x"
     odd.mkdir()
@@ -672,6 +674,7 @@ def test_kit_skill_states_the_honest_limits():
         assert needle.lower() in text.lower(), needle
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="cloud sessions run on Linux; this case needs POSIX sh, paths and temp semantics")
 def test_printed_expand_command_works_in_the_kit(repo, tmp_path):
     """The compressed output tells the model to run `measure.py expand <id>`; that must work, even
     when the later Bash command sees a different TMPDIR than the hook did."""
