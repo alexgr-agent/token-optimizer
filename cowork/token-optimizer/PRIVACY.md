@@ -106,6 +106,7 @@ A Claude Code cloud session (claude.ai/code) runs on a virtual machine managed b
   - `.to-cloud/checkpoints/latest.json` (`--continuity`): git branch and commit, repo-relative paths of files edited in the session, and counters. It contains no conversation text. If you commit it, anyone with access to the repository can read those paths. The next cloud session reads it back as plain data, validates it, and does not treat it as instructions.
 - **Local import:** `measure.py cloud-import` reads these files from a checkout and stores them in `trends.db` tables separate from provider-reported session data. The files are validated and size-limited on import.
 - **Not the same as the local checkpoints above:** the local checkpoint files described under "Checkpoints" hold truncated conversation text and are never copied into a repository.
+- **Local SQLite stores stay in the VM:** the per-session SQLite store (cached tool outputs, file reads) and the archive of full tool results live in the VM's temporary state directory. They are never copied into the repository and are lost when the session ends. Only the two metadata files above can leave the VM, and only if you opt in and commit them.
 - **Not covered:** Cowork. Whether Token Optimizer's hooks run in Cowork cloud sessions is unverified.
 
 ## Credential Handling
