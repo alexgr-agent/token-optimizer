@@ -124,18 +124,21 @@ Then in Claude Code: `/token-optimizer`
 >
 > After install, run `/token-optimizer` once to set up hooks. From there, everything runs automatically: compression, checkpoints, quality scoring, dashboard updates. You don't need to run any command again unless you want an audit.
 
-> **Claude Code cloud sessions (claude.ai/code).** A cloud session runs in a fresh container and never reads the plugins installed on your machine, so the two commands above are not enough there (`/plugin` itself is not available in cloud sessions). Either enable Token Optimizer for your claude.ai account (Desktop app → **Customize** → plugins), or commit this to the repo's `.claude/settings.json` so every cloud session on that repo installs it at start:
+> **Claude Code cloud sessions (claude.ai/code).** A cloud session runs on a fresh VM from a fresh clone of your repository, so the two plugin commands above do not apply there (`/plugin` is not available in cloud sessions). Anthropic's [cloud environments](https://code.claude.com/docs/en/cloud-environments) page says plugins and marketplaces declared in a repo's `.claude/settings.json` (`enabledPlugins`, `extraKnownMarketplaces`) are not installed in cloud sessions, so the settings snippet that earlier versions of this README showed should not be relied on. Whether a plugin enabled on your claude.ai account syncs into cloud sessions is not settled: the same documentation lists a `syncClaudeAiPlugins` setting, and we have not verified either way yet. Do not rely on the plugin in cloud sessions until that is confirmed.
 >
-> ```json
-> {
->   "extraKnownMarketplaces": {
->     "alexgreensh-token-optimizer": { "source": { "source": "github", "repo": "alexgreensh/token-optimizer" } }
->   },
->   "enabledPlugins": { "token-optimizer@alexgreensh-token-optimizer": true }
-> }
+> What does carry into a cloud session is what you commit to the repo: `.claude/settings.json` hooks, `.claude/skills/`, and scripts. From a checkout of this repo, write that into your project:
+>
+> ```bash
+> python3 skills/token-optimizer/scripts/measure.py cloud-init --target /path/to/your/repo
 > ```
 >
-> Hooks, compression and redaction behave the same inside the container. Each cloud session starts with an empty state directory, so the dashboard and audit history there cover that session only.
+> Review the diff and commit it yourself; the command never commits or pushes. In a cloud session the hooks compress large Bash output and keep the original recoverable for that session. Limits, stated plainly:
+>
+> - Claude Code cloud only, and only sessions with a single repository (with several repositories Claude Code reads only `enabledPlugins` and `extraKnownMarketplaces` from each repo's settings, so the hooks do not run). Cowork is not covered: whether hooks run in Cowork cloud sessions is unverified, and Cowork's built-in usage telemetry is OpenTelemetry for Team and Enterprise organizations only ([Anthropic's Cowork monitoring article](https://support.claude.com/en/articles/14477985-monitor-claude-cowork-activity-with-opentelemetry)).
+> - The VM and its state are gone when the session ends. The dashboard, audit history and savings counters cover one session. Nothing is carried over unless you opt in below.
+> - Opt-in, off by default: `--state-out` writes a metadata-only summary (counters, timestamps, session id, transcript URL, never prompts, code, file contents or tool output) to `.to-cloud/<session-id>.json`; `--continuity` writes `.to-cloud/checkpoints/latest.json` (git branch and commit, repo-relative paths of files edited, counters) and restores it as plain data at the next cloud SessionStart. Token Optimizer never commits or pushes these files.
+> - `measure.py cloud-import` loads those files into your local `trends.db` as a separate, labeled table (`platform=claude-code-cloud`). These numbers are an in-VM self-report with Token Optimizer's own token estimates. They are not provider-reported usage and are never mixed into the provider-reported session data. Credential redactions are not counted in this build.
+> - `measure.py doctor` inside a cloud session adds a "Cloud route" row (repo hooks, plugin, or none); `measure.py cloud-doctor` gives the detail. `measure.py cloud-init --help` lists the options.
 
 <details>
 <summary><b>Other platforms and install methods</b></summary>

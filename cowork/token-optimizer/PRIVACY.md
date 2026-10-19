@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Token Optimizer** is a source-available developer tool that runs entirely on your local machine. It optimizes AI coding assistant context windows across Claude Code, Codex, OpenClaw, OpenCode, Hermes, and Google Antigravity.
+**Token Optimizer** is a source-available developer tool that runs on the machine where your AI coding assistant runs: your own computer for a local session, or the cloud virtual machine for a Claude Code cloud session (see [Claude Code cloud sessions](#claude-code-cloud-sessions)). It optimizes AI coding assistant context windows across Claude Code, Codex, OpenClaw, OpenCode, Hermes, and Google Antigravity.
 
 ## No External Data Transmission
 
@@ -95,6 +95,19 @@ The Google Antigravity adapter keeps its own minimal state under
 The installed plugin payload lives at `~/.gemini/config/plugins/token-optimizer/`
 and is removed by `antigravity-uninstall`.
 
+## Claude Code cloud sessions
+
+A Claude Code cloud session (claude.ai/code) runs on a virtual machine managed by Anthropic, not on your computer. If you run `measure.py cloud-init` on a repository and commit the result, Token Optimizer's hooks run on that VM during cloud sessions on that repository. What that means for your data:
+
+- **Where it runs:** on Anthropic's VM, inside the session. Token Optimizer adds no network request of its own. Anthropic's handling of the session is governed by Anthropic's terms and settings, not by this policy.
+- **State on the VM:** compression archives and counters live in the VM's temporary directory and are deleted with the VM when the session ends. Nothing is stored under a home directory.
+- **Files written into your repository (both opt-in, off by default, never committed or pushed by Token Optimizer):**
+  - `.to-cloud/<session-id>.json` (`--state-out`): counters, timestamps, estimated token figures, feature names, the session id and the claude.ai transcript URL. It never contains prompts, code, file contents, command text or tool output.
+  - `.to-cloud/checkpoints/latest.json` (`--continuity`): git branch and commit, repo-relative paths of files edited in the session, and counters. It contains no conversation text. If you commit it, anyone with access to the repository can read those paths. The next cloud session reads it back as plain data, validates it, and does not treat it as instructions.
+- **Local import:** `measure.py cloud-import` reads these files from a checkout and stores them in `trends.db` tables separate from provider-reported session data. The files are validated and size-limited on import.
+- **Not the same as the local checkpoints above:** the local checkpoint files described under "Checkpoints" hold truncated conversation text and are never copied into a repository.
+- **Not covered:** Cowork. Whether Token Optimizer's hooks run in Cowork cloud sessions is unverified.
+
 ## Credential Handling
 
 Token Optimizer scans for 28 credential patterns (AWS keys, API tokens, GitHub PATs, database URIs, JWTs, PEM keys, URL query/fragment auth params, and more) and replaces them with `[CREDENTIAL REDACTED: <type>]` before writing to the session store and tool archive. This redaction is one-way and permanent in stored content.
@@ -179,7 +192,7 @@ Manual deletion: remove the following directories:
 
 Locally installed extensions (see `docs/local-extensions.md`) may run inside the session-end flush worker; Token Optimizer ships none by default.
 
-The same privacy guarantees apply across all supported platforms (Claude Code, Codex, OpenCode, Hermes, Copilot, Cursor, Google Antigravity). Data paths vary by platform but the architecture is identical: local-only, zero network, credential-redacted storage.
+The same privacy guarantees apply across all supported platforms (Claude Code, Codex, OpenCode, Hermes, Copilot, Cursor, Google Antigravity). Data paths vary by platform but the architecture is identical: local-only, zero network, credential-redacted storage. The exception is where "local" is a Claude Code cloud VM, described above.
 
 Consent is tracked per-runtime. A user running both Claude Code and Codex must acknowledge consent separately in each runtime. Antigravity collection is additionally gated by the bridge itself (R20): the Antigravity hooks and rollup no-op until `~/.gemini/token-optimizer/config.json` records `antigravity_consent: true`.
 

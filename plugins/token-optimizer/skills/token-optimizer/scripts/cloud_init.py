@@ -12,7 +12,8 @@ the repo: ``.claude/settings.json`` hooks, ``.claude/skills/`` and scripts.
 
     .claude/settings.json                         hooks block (merged, idempotent)
     .claude/to-cloud/to_cloud_hook.py             hook dispatcher (stdlib only)
-    .claude/to-cloud/engine/*.py                  Bash output compression modules
+    .claude/to-cloud/engine/*.py                  Bash output compression modules, plus an
+                                                  expand-only measure.py (cloud_expand.py)
     .claude/to-cloud/config.json                  opt-in switches (both off)
     .claude/to-cloud/manifest.json                sha256 of every file written
     .claude/skills/token-optimizer-cloud/SKILL.md short skill describing the above
@@ -277,7 +278,7 @@ def install(target: Path, state_out=None, continuity=None, gitignore=False, dry_
     if not (target / ".git").exists():
         raise ValueError("target is not the root of a git repository (no .git): %s" % target)
     missing = [m for m in ENGINE_MODULES if not (SCRIPTS_DIR / (m + ".py")).is_file()]
-    if missing or not (SCRIPTS_DIR / "cloud_hook.py").is_file():
+    if missing or not (SCRIPTS_DIR / "cloud_hook.py").is_file() or not (SCRIPTS_DIR / "cloud_expand.py").is_file():
         raise ValueError("incomplete Token Optimizer checkout, missing: %s" % ", ".join(missing or ["cloud_hook.py"]))
 
     settings_path = target / SETTINGS
@@ -297,6 +298,9 @@ def install(target: Path, state_out=None, continuity=None, gitignore=False, dry_
     planned[TO_DIR / "to_cloud_hook.py"] = (SCRIPTS_DIR / "cloud_hook.py").read_bytes()
     for m in ENGINE_MODULES:
         planned[TO_DIR / "engine" / (m + ".py")] = (SCRIPTS_DIR / (m + ".py")).read_bytes()
+    # The engine tells the model to run `<engine dir>/measure.py expand <id>`. In the kit that
+    # file is the small expand-only helper, so the printed command works in a cloud session.
+    planned[TO_DIR / "engine" / "measure.py"] = (SCRIPTS_DIR / "cloud_expand.py").read_bytes()
     planned[TO_DIR / "VERSION"] = (version + "\n").encode("utf-8")
     planned[SKILL_DIR / "SKILL.md"] = SKILL_MD.encode("utf-8")
     planned[TO_DIR / "config.json"] = (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -326,7 +330,7 @@ def install(target: Path, state_out=None, continuity=None, gitignore=False, dry_
     engine_dir = target / TO_DIR / "engine"
     if engine_dir.is_dir():
         for old in engine_dir.glob("*.py"):
-            if old.stem not in ENGINE_MODULES:
+            if old.stem not in ENGINE_MODULES and old.stem != "measure":
                 old.unlink()
     for rel, data in planned.items():
         _atomic_write(target / rel, data, 0o755 if rel.name == "to_cloud_hook.py" else 0o644)
@@ -462,7 +466,8 @@ def main_init(argv: list) -> int:
         print("Next: review the diff, then commit and push it yourself (this command does not).")
         print("Scope: Claude Code cloud, single-repository sessions. Cowork is not covered.")
         print("Numbers from the kit are an in-VM self-report, not provider-reported usage.")
-        print("Summaries are local files; add --gitignore to keep .to-cloud/*.json out of commits.")
+        if not report.get("gitignore"):
+            print("Summaries are local files; add --gitignore to keep .to-cloud/*.json out of commits.")
     return 0
 
 

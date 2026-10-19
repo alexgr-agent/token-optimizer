@@ -42,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +60,13 @@ PROVENANCE = (
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSY = {"0", "false", "no", "off"}
 _SAFE_ID = re.compile(r"[^A-Za-z0-9_-]")
+_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,96}")
+_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_URL_RE = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,96}")
+_BRANCH_RE = re.compile(r"[A-Za-z0-9._/@+-]{1,120}")
+# Characters allowed in a restored file path: word characters (any script), dot, slash,
+# dash, plus, at, tilde, and a plain space. No quotes, backticks, control characters.
+_PATH_RE = re.compile(r"[\w.@+~/ -]{1,200}")
 _EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 MAX_FILES = 40
 MAX_PATH_LEN = 200
@@ -87,7 +95,11 @@ def data_dir() -> str:
     override = os.environ.get("TOKEN_OPTIMIZER_SNAPSHOT_DIR", "").strip()
     if override:
         return os.path.expanduser(override)
-    return os.path.join(tempfile.gettempdir(), "token-optimizer-cloud")
+    # Fixed under /tmp (not $TMPDIR) so a Bash command the model runs later, which may see a
+    # different TMPDIR than the hook did, finds the same archive. Keep equal to cloud_expand.py.
+    base = "/tmp" if os.name == "posix" else tempfile.gettempdir()
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return os.path.join(base, "token-optimizer-cloud-%d" % uid)
 
 
 def load_config() -> dict:
@@ -180,7 +192,7 @@ def _journal_path(sid: str) -> str:
 
 def journal_add(sid: str, event: str) -> None:
     try:
-        os.makedirs(data_dir(), exist_ok=True)
+        os.makedirs(data_dir(), mode=0o700, exist_ok=True)
         fd = os.open(_journal_path(sid), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, _EVENT_CODES[event])
@@ -239,7 +251,7 @@ def _relativize(path: str) -> str:
     rel = os.path.relpath(full, root).replace(os.sep, "/")
     if rel in (".", "") or rel.startswith("../") or len(rel) > MAX_PATH_LEN:
         return ""
-    if any(ord(c) < 32 for c in rel):
+    if not _PATH_RE.fullmatch(rel):
         return ""
     return rel
 
@@ -253,7 +265,7 @@ def touched_add(sid: str, payload: dict) -> None:
         rel = _relativize(raw)
         if not rel:
             return
-        os.makedirs(data_dir(), exist_ok=True)
+        os.makedirs(data_dir(), mode=0o700, exist_ok=True)
         fd = os.open(_touched_path(sid), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, (rel + "\n").encode("utf-8", "replace"))
@@ -297,7 +309,7 @@ def compression_stats() -> dict:
     if not os.path.isfile(db):
         return stats
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % db.replace("?", "%3f"), uri=True, timeout=0.5)
+        conn = sqlite3.connect("file:%s?mode=ro" % quote(db), uri=True, timeout=0.5)
         try:
             rows = conn.execute(
                 "SELECT feature, COUNT(*), COALESCE(SUM(original_tokens),0), "
@@ -379,10 +391,34 @@ def build_summary(sid: str, payload: dict | None = None) -> dict:
     }
 
 
+def _repo_out_dir(*parts: str) -> str:
+    """Directory under the project for an opt-in output, or '' if it is unsafe.
+
+    The repo is untrusted input: refuse a symlinked .to-cloud (or checkpoints) and
+    anything that resolves outside the project root.
+    """
+    root = os.path.realpath(project_dir())
+    path = os.path.join(root, *parts)
+    probe = root
+    for part in parts:
+        probe = os.path.join(probe, part)
+        if os.path.islink(probe):
+            return ""
+    real = os.path.realpath(path)
+    if real != path and not real.startswith(root + os.sep):
+        return ""
+    return path
+
+
 def write_summary(sid: str, payload: dict | None = None) -> str:
     if not sid:
         return ""
-    path = os.path.join(project_dir(), ".to-cloud", sid + ".json")
+    out_dir = _repo_out_dir(".to-cloud")
+    if not out_dir:
+        return ""
+    path = os.path.join(out_dir, sid + ".json")
+    if os.path.islink(path):
+        return ""
     ok = atomic_write(path, json.dumps(build_summary(sid, payload), indent=2, sort_keys=True) + "\n")
     return path if ok else ""
 
@@ -416,15 +452,21 @@ def write_checkpoint(sid: str) -> str:
     if len(text.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
         cp["files_touched"] = cp["files_touched"][-10:]
         text = json.dumps(cp, indent=2, sort_keys=True) + "\n"
-    base = os.path.join(project_dir(), ".to-cloud", "checkpoints")
+    base = _repo_out_dir(".to-cloud", "checkpoints")
+    if not base or os.path.islink(os.path.join(base, "latest.json")):
+        return ""
     ok = atomic_write(os.path.join(base, "latest.json"), text)
     return os.path.join(base, "latest.json") if ok else ""
 
 
 def load_checkpoint(path: str) -> dict | None:
-    """Read and strictly validate a checkpoint file. None if anything is off."""
+    """Read and strictly validate a checkpoint file. None if anything is off.
+
+    The file comes from the repository, so it is treated as untrusted: every field
+    is matched against a narrow pattern, so no free text can reach the model.
+    """
     try:
-        if os.path.getsize(path) > MAX_CHECKPOINT_BYTES * 2:
+        if os.path.islink(path) or os.path.getsize(path) > MAX_CHECKPOINT_BYTES * 2:
             return None
         with open(path, "r", encoding="utf-8") as fh:
             cp = json.load(fh)
@@ -433,35 +475,36 @@ def load_checkpoint(path: str) -> dict | None:
     if not isinstance(cp, dict) or cp.get("schema") != CHECKPOINT_SCHEMA:
         return None
     out: dict = {"schema": CHECKPOINT_SCHEMA}
-    for key in ("session_id", "saved_at", "started_at", "transcript_url"):
+    for key, rx in (("session_id", _ID_RE), ("saved_at", _TS_RE), ("started_at", _TS_RE)):
         val = cp.get(key, "")
-        if not isinstance(val, str) or len(val) > 200 or any(ord(c) < 32 for c in val):
+        if not isinstance(val, str) or not rx.fullmatch(val):
             return None
         out[key] = val
-    if out["transcript_url"] and not out["transcript_url"].startswith("https://claude.ai/code/"):
-        out["transcript_url"] = ""
+    url = cp.get("transcript_url", "")
+    out["transcript_url"] = url if isinstance(url, str) and _URL_RE.fullmatch(url) else ""
     git = cp.get("git") if isinstance(cp.get("git"), dict) else {}
     br, head = git.get("branch", ""), git.get("head", "")
     out["git"] = {
-        "branch": br if isinstance(br, str) and re.fullmatch(r"[A-Za-z0-9._/@+-]{1,120}", br) else "",
+        "branch": br if isinstance(br, str) and _BRANCH_RE.fullmatch(br) else "",
         "head": head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) else "",
     }
     files = cp.get("files_touched") if isinstance(cp.get("files_touched"), list) else []
     clean = []
     for f in files[:MAX_FILES]:
-        if (isinstance(f, str) and 0 < len(f) <= MAX_PATH_LEN and not f.startswith("/")
-                and ".." not in f.split("/") and not any(ord(c) < 32 or ord(c) == 127 for c in f)):
+        if (isinstance(f, str) and _PATH_RE.fullmatch(f) and not f.startswith(("/", " "))
+                and not f.endswith(" ") and ".." not in f.split("/")):
             clean.append(f)
     out["files_touched"] = clean
     counts = cp.get("counts") if isinstance(cp.get("counts"), dict) else {}
-    out["counts"] = {k: int(counts.get(k, 0)) if isinstance(counts.get(k, 0), int) else 0
-                     for k in ("bash_calls", "edit_calls", "compactions")}
+    out["counts"] = {k: min(counts[k], 10**9) if isinstance(counts.get(k), int) and not isinstance(counts.get(k), bool)
+                     and counts[k] >= 0 else 0 for k in ("bash_calls", "edit_calls", "compactions")}
     return out
 
 
 def restore_context(sid: str) -> str:
     """Text for SessionStart additionalContext, or '' when nothing to restore."""
-    candidates = [os.path.join(project_dir(), ".to-cloud", "checkpoints", "latest.json")]
+    base = _repo_out_dir(".to-cloud", "checkpoints")
+    candidates = [os.path.join(base, "latest.json")] if base else []
     best = None
     for path in candidates:
         cp = load_checkpoint(path)
