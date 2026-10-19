@@ -242,10 +242,14 @@ def strip_settings(settings: dict) -> dict:
 def _load_settings(path: Path) -> dict:
     if not path.exists():
         return {}
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")  # tolerate a UTF-8 BOM
     if not text.strip():
         return {}
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(".claude/settings.json is not plain JSON (comments or trailing commas are not "
+                         "supported here); nothing was changed: %s" % exc) from None
     if not isinstance(data, dict):
         raise ValueError(".claude/settings.json is not a JSON object")
     return data

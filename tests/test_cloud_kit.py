@@ -124,7 +124,7 @@ def test_install_preserves_existing_settings_and_hooks(tmp_path):
     assert stop_cmds[0] == "echo mine" and len(stop_cmds) == 2
 
 
-@pytest.mark.parametrize("bad", ["{not json", "[1,2]", '{"hooks": []}', '{"hooks": {"Stop": {}}}'])
+@pytest.mark.parametrize("bad", ["{not json", '{"a": 1, // c\n}', "[1,2]", '{"hooks": []}', '{"hooks": {"Stop": {}}}'])
 def test_install_refuses_unusable_settings_without_writing(tmp_path, bad):
     r = _git_repo(tmp_path / "r")
     (r / ".claude").mkdir()
@@ -697,3 +697,27 @@ def test_printed_expand_command_works_in_the_kit(repo, tmp_path):
     assert out.returncode == 0, out.stderr
     assert "src/file2499.py:2499" in out.stdout
     shutil.rmtree("/tmp/token-optimizer-cloud-%d/tool-archive/%s" % (os.getuid(), sid), ignore_errors=True)
+
+
+def test_bom_prefixed_settings_are_accepted(tmp_path):
+    r = _git_repo(tmp_path / "r")
+    (r / ".claude").mkdir()
+    (r / ".claude/settings.json").write_bytes(b'\xef\xbb\xbf{"permissions": {"allow": ["Bash(ls)"]}}')
+    cloud_init.install(r)
+    s = json.loads((r / ".claude/settings.json").read_text())
+    assert s["permissions"] == {"allow": ["Bash(ls)"]} and "SessionStart" in s["hooks"]
+
+
+@pytest.mark.parametrize("payload", [
+    b"", b"\xff\xfe\x00garbage", b"[]", b"null", b'{"tool_name": "Bash"}',
+    b'{"tool_name":"Bash","tool_input":"x","tool_response":5}',
+    b'{"session_id":"../../etc","tool_name":"Bash","tool_input":{"command":1},"tool_response":{"stdout":null}}',
+    b'{"session_id":"s","tool_name":"Edit","tool_input":{"file_path":{"a":1}}}',
+])
+def test_hooks_survive_malformed_payloads(repo, tmp_path, payload):
+    env = _env(repo, tmp_path)
+    for ev in ("SessionStart", "PostToolUse", "PreCompact", "Stop"):
+        r = subprocess.run(["sh", "-c", _hook_cmd(repo, ev)], input=payload, capture_output=True,
+                           env=env, cwd=str(repo), timeout=60)
+        assert r.returncode == 0, (ev, r.stderr[-300:])
+    assert not list((tmp_path).glob("../etc*"))
